@@ -222,10 +222,8 @@ func (s *Server) handleInternalCall(
 		EnabledFeatures: []livekit.SIPFeature{},
 		RingingTimeout:  30 * time.Second,
 		MaxCallDuration: 4 * time.Hour,
-		MediaConfig: &livekit.SIPMediaConfig{
-			// TLS signaling = SRTP media. Yealink expects encrypted RTP on TLS calls.
-			Encryption: livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_REQUIRE.Enum(),
-		},
+		// Plain RTP first — get media relay working before adding SRTP
+		MediaConfig: &livekit.SIPMediaConfig{},
 	}
 }
 
@@ -291,10 +289,8 @@ func (s *Server) handleExternalCall(
 		EnabledFeatures: []livekit.SIPFeature{},
 		RingingTimeout:  60 * time.Second,
 		MaxCallDuration: 4 * time.Hour,
-		MediaConfig: &livekit.SIPMediaConfig{
-			// TLS signaling = SRTP media. Yealink expects encrypted RTP on TLS calls.
-			Encryption: livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_REQUIRE.Enum(),
-		},
+		// Plain RTP first — get media relay working before adding SRTP
+		MediaConfig: &livekit.SIPMediaConfig{},
 	}
 }
 

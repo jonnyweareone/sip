@@ -2027,9 +2027,11 @@ func (c *sipInbound) setCSeq(req *sip.Request) {
 func (c *sipInbound) sendBye(ctx context.Context) {
 	ctx = context.WithoutCancel(ctx)
 	if c.inviteOk == nil {
+		c.log.Infow("SONIQ sendBye: no inviteOk, call not established")
 		return // call wasn't established
 	}
 	if c.invite == nil {
+		c.log.Infow("SONIQ sendBye: no invite, rejected or closed")
 		return // rejected or closed
 	}
 	ctx, span := Tracer.Start(ctx, "sip.inbound.sendBye")
@@ -2043,6 +2045,7 @@ func (c *sipInbound) sendBye(ctx context.Context) {
 	c.setCSeq(r)
 	c.swapSrcDst(r)
 	c.drop()
+	c.log.Infow("SONIQ sendBye: sending BYE to phone", "dest", r.Destination(), "callID", r.CallID())
 	sendAndACK(ctx, c, r)
 }
 

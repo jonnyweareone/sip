@@ -211,6 +211,8 @@ type udpConn struct {
 	symmetricRTP bool
 	src          atomic.Pointer[netip.AddrPort]
 	dst          atomic.Pointer[netip.AddrPort]
+	rxCount      int64
+	txCount      int64
 }
 
 func (c *udpConn) GetSrc() (netip.AddrPort, bool) {
@@ -241,6 +243,17 @@ func (c *udpConn) Read(b []byte) (n int, err error) {
 	} else if *prev != addr {
 		c.log.Infow("changing media source", "addr", addr.String())
 	}
+	// SONIQ: Log first 10 RTP packets received for debug
+	c.rxCount++
+	if c.rxCount <= 10 {
+		pt := byte(0)
+		ssrc := uint32(0)
+		if n >= 12 {
+			pt = b[1] & 0x7F
+			ssrc = uint32(b[8])<<24 | uint32(b[9])<<16 | uint32(b[10])<<8 | uint32(b[11])
+		}
+		c.log.Infow("SONIQ RTP rx", "pkt", c.rxCount, "src", addr.String(), "len", n, "pt", pt, "ssrc", ssrc)
+	}
 	if c.symmetricRTP {
 		dst := c.dst.Load()
 		if dst == nil || !dst.IsValid() || *dst != addr {
@@ -254,6 +267,17 @@ func (c *udpConn) Write(b []byte) (n int, err error) {
 	dst := c.dst.Load()
 	if dst == nil {
 		return len(b), nil // ignore
+	}
+	// SONIQ: Log first 10 RTP packets sent for debug
+	c.txCount++
+	if c.txCount <= 10 {
+		pt := byte(0)
+		ssrc := uint32(0)
+		if len(b) >= 12 {
+			pt = b[1] & 0x7F
+			ssrc = uint32(b[8])<<24 | uint32(b[9])<<16 | uint32(b[10])<<8 | uint32(b[11])
+		}
+		c.log.Infow("SONIQ RTP tx", "pkt", c.txCount, "dst", dst.String(), "len", len(b), "pt", pt, "ssrc", ssrc)
 	}
 	return c.WriteToUDPAddrPort(b, *dst)
 }
