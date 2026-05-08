@@ -17,6 +17,7 @@ package sip
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -337,8 +338,10 @@ func NewMediaPortWith(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor,
 	if conn == nil {
 		c, err := rtp.ListenUDPPortRange(opts.Ports.Start, opts.Ports.End, netip.AddrFrom4([4]byte{0, 0, 0, 0}))
 		if err != nil {
+			log.Errorw("SONIQ: failed to open RTP UDP port", err, "range", fmt.Sprintf("%d-%d", opts.Ports.Start, opts.Ports.End))
 			return nil, err
 		}
+		log.Infow("SONIQ: RTP UDP port opened", "addr", c.LocalAddr().String())
 		conn = c
 	}
 	mediaTimeout := make(chan struct{})
