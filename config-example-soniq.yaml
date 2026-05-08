@@ -21,8 +21,8 @@ tls:
   port: 5061
   port_listen: 5061
   certs:
-    - cert_file: /etc/livekit-sip/tls/fullchain.pem
-      key_file: /etc/livekit-sip/tls/privkey.pem
+    - cert_file: /opt/soniq-certs/server/server.crt
+      key_file: /opt/soniq-certs/server/server.key
   min_version: "tls1.2"
 
 rtp_port:
@@ -33,7 +33,7 @@ rtp_port:
 soniq:
   reg_port: 5080
   reg_port_listen: 5080
-  ca_cert_file: /etc/livekit-sip/soniq-ca.pem  # SONIQ CA for device client certs
+  ca_cert_file: /opt/soniq-certs/ca/ca.crt
   supabase_url: https://dtosgubmmdqxbeirtbom.supabase.co
   supabase_anon_key: ${SUPABASE_ANON_KEY}
   node_id: lhr-1
