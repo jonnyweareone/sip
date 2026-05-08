@@ -424,9 +424,11 @@ func (s *Server) buildRegTLSConfig(baseTLS *tls.Config) (*tls.Config, error) {
 	}
 
 	// Clone the base TLS config (server cert, cipher suites, etc.)
-	// and add mTLS requirement
+	// and add mTLS — VerifyClientCertIfGiven allows phones without certs
+	// to still connect (they'll be verified by Supabase lookup instead).
+	// Switch to RequireAndVerifyClientCert once cert provisioning is confirmed working.
 	regTLS := baseTLS.Clone()
-	regTLS.ClientAuth = tls.RequireAndVerifyClientCert
+	regTLS.ClientAuth = tls.VerifyClientCertIfGiven
 	regTLS.ClientCAs = caPool
 
 	return regTLS, nil
