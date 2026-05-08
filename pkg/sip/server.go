@@ -429,6 +429,32 @@ func (s *Server) buildRegTLSConfig(baseTLS *tls.Config) (*tls.Config, error) {
 	regTLS := baseTLS.Clone()
 	regTLS.ClientAuth = tls.VerifyClientCertIfGiven
 	regTLS.ClientCAs = caPool
+	// Override VerifyPeerCertificate to handle empty cert lists gracefully.
+	// The upstream ConfigureTLS sets a callback that panics on certs[1:] when
+	// the client sends no certificate (VerifyClientCertIfGiven mode).
+	regTLS.VerifyPeerCertificate = func(certificates [][]byte, verifiedChains [][]*x509.Certificate) error {
+		if len(certificates) == 0 {
+			return nil // No client cert — that's fine, digest auth will handle it
+		}
+		certs := make([]*x509.Certificate, len(certificates))
+		for i, asn1Data := range certificates {
+			cert, err := x509.ParseCertificate(asn1Data)
+			if err != nil {
+				return fmt.Errorf("failed to parse client certificate: %w", err)
+			}
+			certs[i] = cert
+		}
+		opts := x509.VerifyOptions{
+			Roots:         caPool,
+			Intermediates: x509.NewCertPool(),
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		}
+		for _, cert := range certs[1:] {
+			opts.Intermediates.AddCert(cert)
+		}
+		_, err := certs[0].Verify(opts)
+		return err
+	}
 
 	return regTLS, nil
 }
