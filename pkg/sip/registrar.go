@@ -99,7 +99,6 @@ func (reg *Registrar) OnRegister(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	identity := from.Address.User
 
-	contactHdr := req.GetHeader("Contact")
 	uaHdr := req.GetHeader("User-Agent")
 	userAgent := ""
 	if uaHdr != nil {
