@@ -430,11 +430,12 @@ func (s *Server) buildRegTLSConfig(baseTLS *tls.Config) (*tls.Config, error) {
 	}
 
 	// Build a CLEAN TLS config — no InsecureSkipVerify, no broken VerifyPeerCertificate.
-	// Just standard Go TLS with our server cert + optional client cert validation.
+	// NoClientCert: don't request client certs at all. Digest auth handles identity.
+	// TLS encrypts the transport. This matches how Drachtio worked.
+	// TODO: re-add mTLS once device certs have ExtKeyUsageClientAuth
 	regTLS := &tls.Config{
 		Certificates: baseTLS.Certificates,
-		ClientAuth:   tls.VerifyClientCertIfGiven,
-		ClientCAs:    caPool,
+		ClientAuth:   tls.NoClientCert,
 		NextProtos:   []string{"sip"},
 		MinVersion:   tls.VersionTLS12,
 	}
