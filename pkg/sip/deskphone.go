@@ -19,8 +19,11 @@ package sip
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
+
+	pionsdp "github.com/pion/sdp/v3"
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -302,32 +305,73 @@ func (s *Server) handleExternalCall(
 }
 
 // fixNATedSDP rewrites private IP addresses in SDP to the phone's public NAT IP.
+// Uses pion/sdp for proper SDP parsing — handles all connection info fields
+// at session level and per-media level.
+//
+// Every phone behind NAT advertises its private LAN IP in SDP.
+// We replace with the public IP from the SIP Via received parameter.
 // This is the Go equivalent of Kamailio's fix_nated_sdp().
-//
-// Phones behind NAT advertise their private LAN IP in SDP:
-//   c=IN IP4 192.168.0.170
-//   o=- 123 456 IN IP4 192.168.0.170
-//
-// We replace with the public IP from the SIP Via received parameter:
-//   c=IN IP4 81.108.56.41
-//   o=- 123 456 IN IP4 81.108.56.41
-//
-// This works for all phones behind any NAT — home routers, office firewalls,
-// carrier-grade NAT. The public IP is always available from the Via header.
 func fixNATedSDP(sdpBytes []byte, publicIP string) []byte {
 	if publicIP == "" {
 		return sdpBytes
 	}
+
+	var sess pionsdp.SessionDescription
+	if err := sess.Unmarshal(sdpBytes); err != nil {
+		// Can't parse — return unchanged, string fallback
+		return fixNATedSDPString(sdpBytes, publicIP)
+	}
+
+	changed := false
+
+	// Fix session-level connection (c= line)
+	if sess.ConnectionInformation != nil && sess.ConnectionInformation.Address != nil {
+		addr := sess.ConnectionInformation.Address.Address
+		if isPrivateIP(addr) {
+			sess.ConnectionInformation.Address.Address = publicIP
+			changed = true
+		}
+	}
+
+	// Fix origin (o= line)
+	if isPrivateIP(sess.Origin.UnicastAddress) {
+		sess.Origin.UnicastAddress = publicIP
+		changed = true
+	}
+
+	// Fix per-media connection info
+	for i := range sess.MediaDescriptions {
+		md := sess.MediaDescriptions[i]
+		if md.ConnectionInformation != nil && md.ConnectionInformation.Address != nil {
+			addr := md.ConnectionInformation.Address.Address
+			if isPrivateIP(addr) {
+				md.ConnectionInformation.Address.Address = publicIP
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return sdpBytes
+	}
+
+	out, err := sess.Marshal()
+	if err != nil {
+		return sdpBytes // marshal failed, return original
+	}
+	return out
+}
+
+// fixNATedSDPString is a string-based fallback if pion/sdp can't parse the SDP.
+func fixNATedSDPString(sdpBytes []byte, publicIP string) []byte {
 	lines := strings.Split(string(sdpBytes), "\r\n")
 	for i, line := range lines {
-		// Fix connection line: c=IN IP4 192.168.x.x
 		if strings.HasPrefix(line, "c=IN IP4 ") {
 			oldIP := strings.TrimPrefix(line, "c=IN IP4 ")
 			if isPrivateIP(oldIP) {
 				lines[i] = "c=IN IP4 " + publicIP
 			}
 		}
-		// Fix origin line: o=- 123 456 IN IP4 192.168.x.x
 		if strings.HasPrefix(line, "o=") && strings.Contains(line, "IN IP4 ") {
 			parts := strings.Split(line, " IN IP4 ")
 			if len(parts) == 2 && isPrivateIP(parts[1]) {
@@ -338,18 +382,16 @@ func fixNATedSDP(sdpBytes []byte, publicIP string) []byte {
 	return []byte(strings.Join(lines, "\r\n"))
 }
 
-// isPrivateIP checks if an IP string is a private/local address.
-func isPrivateIP(ip string) bool {
-	return strings.HasPrefix(ip, "192.168.") ||
-		strings.HasPrefix(ip, "10.") ||
-		strings.HasPrefix(ip, "172.16.") ||
-		strings.HasPrefix(ip, "172.17.") ||
-		strings.HasPrefix(ip, "172.18.") ||
-		strings.HasPrefix(ip, "172.19.") ||
-		strings.HasPrefix(ip, "172.2") ||
-		strings.HasPrefix(ip, "172.30.") ||
-		strings.HasPrefix(ip, "172.31.") ||
-		strings.HasPrefix(ip, "169.254.") ||
-		ip == "127.0.0.1" ||
-		ip == "0.0.0.0"
+// isPrivateIP checks if an IP string is a private/local address (RFC1918, link-local, loopback).
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		// Fall back to string prefix check
+		return strings.HasPrefix(ipStr, "192.168.") ||
+			strings.HasPrefix(ipStr, "10.") ||
+			strings.HasPrefix(ipStr, "172.") ||
+			strings.HasPrefix(ipStr, "169.254.") ||
+			ipStr == "127.0.0.1" || ipStr == "0.0.0.0"
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
 }
