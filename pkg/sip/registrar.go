@@ -85,7 +85,7 @@ func (reg *Registrar) OnRegister(req *sip.Request, tx sip.ServerTransaction) {
 	// Identity from From header username (e.g. "1002.soniq-master")
 	// This matches the cert CN provisioned to the device.
 	from := req.From()
-	if from == nil || from.Address == nil {
+	if from == nil {
 		log.Warnw("REGISTER missing From header", nil)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Bad Request", nil))
 		return
