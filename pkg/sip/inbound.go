@@ -943,6 +943,12 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 			return err // already sent a response
 		}
 	}
+
+	// SONIQ: Log the SDP answer we send to the phone so we can verify the c= line IP
+	if c.cc.natPublicIP != "" && answerData != nil {
+		c.log().Infow("SDP answer to deskphone", "sdp", string(answerData))
+	}
+
 	p := &disp.Room.Participant
 	p.Attributes = HeadersToAttrs(p.Attributes, disp.HeadersToAttributes, disp.IncludeHeaders, c.cc, nil)
 	if disp.MaxCallDuration <= 0 || disp.MaxCallDuration > maxCallDuration {
