@@ -47,6 +47,7 @@ type sipCredential struct {
 	OrgID         string  `json:"org_id"`
 	Username      string  `json:"username"`       // "2000.workfones" = LiveKit identity
 	PasswordPlain *string `json:"password_plain"`  // plaintext for digest auth
+	DisplayName   *string `json:"display_name"`    // "Barry Kaye"
 	Enabled       bool    `json:"enabled"`
 }
 
@@ -230,7 +231,7 @@ func (reg *Registrar) OnRegister(req *sip.Request, tx sip.ServerTransaction) {
 
 // lookupCredentials queries Supabase PostgREST for sip_credentials.
 func (reg *Registrar) lookupCredentials(ctx context.Context, username string) (*sipCredential, error) {
-	url := fmt.Sprintf("%s/rest/v1/sip_credentials?username=eq.%s&select=id,org_id,username,password_plain,enabled&limit=1",
+	url := fmt.Sprintf("%s/rest/v1/sip_credentials?username=eq.%s&select=id,org_id,username,password_plain,display_name,enabled&limit=1",
 		reg.soniq.SupabaseURL, username)
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {

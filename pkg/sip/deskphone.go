@@ -51,21 +51,17 @@ func extensionFromIdentity(identity string) string {
 	return identity
 }
 
-// displayName returns a human-readable name for a call participant.
-// Looks up the display name from Supabase sip_credentials if available,
-// otherwise returns just the extension number.
+// displayName returns "Jonny Robinson (1000)" for display on the callee's phone.
 func (s *Server) displayName(ctx context.Context, identity string) string {
 	ext := extensionFromIdentity(identity)
 	if s.registrar == nil {
 		return ext
 	}
 	cred, err := s.registrar.lookupCredentials(ctx, identity)
-	if err != nil || cred == nil {
+	if err != nil || cred == nil || cred.DisplayName == nil || *cred.DisplayName == "" {
 		return ext
 	}
-	// TODO: lookup display_name from sip_credentials or org_users
-	// For now return extension
-	return ext
+	return fmt.Sprintf("%s (%s)", *cred.DisplayName, ext)
 }
 
 // processRegisteredInvite handles an INVITE from a registered deskphone.
