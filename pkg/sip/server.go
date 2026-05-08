@@ -402,15 +402,21 @@ func (s *Server) Stop() {
 	}
 }
 
-// buildRegTLSConfig creates a TLS config for the SONIQ registration port (5080)
-// with mutual TLS — RequireAndVerifyClientCert using the SONIQ CA.
+// buildRegTLSConfig creates a CLEAN TLS config for the SONIQ registration port (5080).
+// Does NOT clone baseTLS because upstream ConfigureTLS sets a broken
+// VerifyPeerCertificate callback that panics on REGISTER from phones.
+// Instead we build from scratch using the same cert but standard Go TLS behaviour.
 func (s *Server) buildRegTLSConfig(baseTLS *tls.Config) (*tls.Config, error) {
 	soniq := s.conf.SONIQ
 	if soniq.CACertFile == "" {
-		// No CA configured — fall back to server-only TLS (no client cert required).
-		// Still works but without device identity verification.
 		s.log.Warnw("SONIQ CA cert not configured, registration port will not require client certs", nil)
-		return baseTLS, nil
+		// Build clean config with just the server cert, no client verification
+		regTLS := &tls.Config{
+			Certificates: baseTLS.Certificates,
+			NextProtos:   []string{"sip"},
+			MinVersion:   tls.VersionTLS12,
+		}
+		return regTLS, nil
 	}
 
 	caPEM, err := os.ReadFile(soniq.CACertFile)
@@ -423,37 +429,14 @@ func (s *Server) buildRegTLSConfig(baseTLS *tls.Config) (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to parse SONIQ CA cert from %s", soniq.CACertFile)
 	}
 
-	// Clone the base TLS config (server cert + CA chain, cipher suites, etc.)
-	// VerifyClientCertIfGiven = validate client cert if presented, but don't require it.
-	// Phones with certs get mTLS + digest (strongest). Phones without get digest only.
-	regTLS := baseTLS.Clone()
-	regTLS.ClientAuth = tls.VerifyClientCertIfGiven
-	regTLS.ClientCAs = caPool
-	// Override VerifyPeerCertificate to handle empty cert lists gracefully.
-	// The upstream ConfigureTLS sets a callback that panics on certs[1:] when
-	// the client sends no certificate (VerifyClientCertIfGiven mode).
-	regTLS.VerifyPeerCertificate = func(certificates [][]byte, verifiedChains [][]*x509.Certificate) error {
-		if len(certificates) == 0 {
-			return nil // No client cert — that's fine, digest auth will handle it
-		}
-		certs := make([]*x509.Certificate, len(certificates))
-		for i, asn1Data := range certificates {
-			cert, err := x509.ParseCertificate(asn1Data)
-			if err != nil {
-				return fmt.Errorf("failed to parse client certificate: %w", err)
-			}
-			certs[i] = cert
-		}
-		opts := x509.VerifyOptions{
-			Roots:         caPool,
-			Intermediates: x509.NewCertPool(),
-			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		}
-		for _, cert := range certs[1:] {
-			opts.Intermediates.AddCert(cert)
-		}
-		_, err := certs[0].Verify(opts)
-		return err
+	// Build a CLEAN TLS config — no InsecureSkipVerify, no broken VerifyPeerCertificate.
+	// Just standard Go TLS with our server cert + optional client cert validation.
+	regTLS := &tls.Config{
+		Certificates: baseTLS.Certificates,
+		ClientAuth:   tls.VerifyClientCertIfGiven,
+		ClientCAs:    caPool,
+		NextProtos:   []string{"sip"},
+		MinVersion:   tls.VersionTLS12,
 	}
 
 	return regTLS, nil
