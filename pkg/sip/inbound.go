@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -1600,6 +1601,21 @@ func (s *Server) newInbound(invite *sip.Request, inviteTx sip.ServerTransaction,
 
 	legTr := legTransportFromReq(invite)
 	contact := s.ContactURI(legTr)
+
+	// SONIQ: If this INVITE arrived on port 5080 (our registration port),
+	// the Contact in responses MUST use port 5080, not 5061.
+	// Otherwise ACK goes to 5061 which has broken upstream TLS config.
+	if s.conf.SONIQ.RegPort > 0 {
+		destPort := 0
+		if dest := invite.Destination(); dest != "" {
+			if _, p, err := net.SplitHostPort(dest); err == nil {
+				destPort, _ = strconv.Atoi(p)
+			}
+		}
+		if destPort == s.conf.SONIQ.RegPort {
+			contact.Addr = netip.AddrPortFrom(contact.Addr.Addr(), uint16(s.conf.SONIQ.RegPort))
+		}
+	}
 	log := s.log.WithValues(
 		"callID", toTag,
 		"traceID", traceid.FromGUID(toTag),
