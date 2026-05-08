@@ -190,11 +190,18 @@ func (reg *Registrar) OnRegister(req *sip.Request, tx sip.ServerTransaction) {
 	}
 
 	// --- Auth passed — store endpoint in Redis ---
-	// ALWAYS use the NAT source IP for the contact URI, never the phone's Contact header.
-	// The phone's Contact contains its private LAN IP (192.168.0.x) which is unreachable
-	// from the server. The NAT source IP (from Via received/rport) is the only way to
-	// reach the phone. This is critical for sending INVITE to registered endpoints.
-	contactURI := fmt.Sprintf("<sip:%s@%s;transport=TLS>", identity, src.String())
+	// Store BOTH the phone's original Contact (private IP, for sipgo connection reuse)
+	// AND the NAT public IP (for SDP rewriting and direct addressing).
+	// sipgo reuses TLS connections by matching the Contact URI — if we rewrite it
+	// to the NAT IP, sipgo tries to dial a NEW connection instead of reusing the
+	// existing registration connection.
+	contactURI := ""
+	if contactHdr := req.GetHeader("Contact"); contactHdr != nil {
+		contactURI = contactHdr.Value()
+	}
+	if contactURI == "" {
+		contactURI = fmt.Sprintf("<sip:%s@%s;transport=TLS>", identity, src.String())
+	}
 	mac := extractMAC(userAgent)
 	ttl := time.Duration(float64(expires)*1.5) * time.Second
 	key := redisEndpointPrefix + identity
