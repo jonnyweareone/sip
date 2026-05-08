@@ -325,6 +325,16 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 		},
 		OnParticipantDisconnected: func(rp *lksdk.RemoteParticipant) {
 			r.participantLeft(rp)
+			// SONIQ: When the last remote participant leaves, close our room connection.
+			// This triggers the outbound call's Disconnected() channel → sends BYE.
+			if room := r.Room(); room != nil {
+				remotes := room.GetParticipants()
+				if len(remotes) == 0 {
+					r.roomLog.Infow("SONIQ: last remote participant left, closing room connection",
+						"leftParticipant", rp.Identity())
+					r.CloseWithReason(livekit.DisconnectReason_CLIENT_INITIATED)
+				}
+			}
 		},
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackPublished: func(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
