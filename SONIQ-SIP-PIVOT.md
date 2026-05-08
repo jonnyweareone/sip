@@ -128,4 +128,29 @@ sip:endpoint:{identity} → hash {
 
 ## Next Session Prompt
 
-"Continue building SONIQ LiveKit SIP fork. Repo at /Users/davidsmith/Documents/GitHub/livekit-sip-soniq on branch soniq. Need to: (1) add registrar.go with REGISTER handler + digest auth + Redis endpoint storage, (2) add OnRegister to server.go Start(), (3) add registration port 5080 TLS config, (4) modify outbound.go to resolve registered endpoints. Reference the architecture doc and state doc."
+"Continue SONIQ LiveKit SIP fork. Repo at /Users/davidsmith/Documents/GitHub/livekit-sip-soniq on branch soniq. All core code is committed. Need to: (1) install Go on dev machine and compile-check, (2) generate SONIQ CA cert + per-device client certs, (3) add cert provisioning endpoint to soniqmail, (4) create sip_credentials entries for test devices, (5) deploy to sip-lhr-1 with the new config, (6) test registration from T58V/T88W."
+
+## Implementation Status (8 May 2026)
+
+### Done
+- [x] registrar.go — mTLS auth (no digest), Supabase lookup, Redis HSET, TTL keepalive
+- [x] actions.go — HTTP action URL server, Ably publish to soniq-router
+- [x] server.go — OnRegister wired, mTLS listener on 5080 with SONIQ CA
+- [x] service.go — ServiceOption pattern, WithRedisClient, lifecycle
+- [x] client.go — endpoint resolution before trunk lookup in CreateSIPParticipant
+- [x] config.go — SONIQConfig with ca_cert_file, reg_port, supabase_url, etc.
+- [x] main.go — Redis client passed through
+- [x] config-example-soniq.yaml
+- [x] yealink-cfg-template.cfg with action URLs + DSS keys + XML browser
+- [x] password_plain backfilled in sip_credentials (26 rows)
+
+### To Do
+- [ ] Install Go on dev machine, compile-check, fix any issues
+- [ ] Generate SONIQ CA keypair (openssl)
+- [ ] Build cert provisioning endpoint (/api/provisioning/cert/{mac})
+- [ ] Deploy forked livekit-sip to sip-lhr-1
+- [ ] Test REGISTER from Yealink T58V
+- [ ] Test internal call (two registered endpoints, one LiveKit room)
+- [ ] Test "use deskphone for meeting audio" flow
+- [ ] Test Lilly XML push to phone screen
+- [ ] Retire Drachtio + soniq-sip-node containers
