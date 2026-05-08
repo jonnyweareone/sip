@@ -26,6 +26,7 @@ import (
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils/guid"
+	"github.com/livekit/sipgo/sip"
 )
 
 // isRegisteredEndpoint checks if the caller is a registered SONIQ deskphone.
@@ -41,6 +42,32 @@ func (s *Server) isRegisteredEndpoint(ctx context.Context, identity string) map[
 	return fields
 }
 
+// extensionFromIdentity strips the org slug from a LiveKit identity.
+// "1003.soniq-master" → "1003"
+func extensionFromIdentity(identity string) string {
+	if idx := strings.Index(identity, "."); idx > 0 {
+		return identity[:idx]
+	}
+	return identity
+}
+
+// displayName returns a human-readable name for a call participant.
+// Looks up the display name from Supabase sip_credentials if available,
+// otherwise returns just the extension number.
+func (s *Server) displayName(ctx context.Context, identity string) string {
+	ext := extensionFromIdentity(identity)
+	if s.registrar == nil {
+		return ext
+	}
+	cred, err := s.registrar.lookupCredentials(ctx, identity)
+	if err != nil || cred == nil {
+		return ext
+	}
+	// TODO: lookup display_name from sip_credentials or org_users
+	// For now return extension
+	return ext
+}
+
 // processRegisteredInvite handles an INVITE from a registered deskphone.
 // This bypasses trunk auth and dispatch rules — the phone is already trusted.
 // Returns true if handled, false if caller is not a registered endpoint
@@ -48,7 +75,7 @@ func (s *Server) isRegisteredEndpoint(ctx context.Context, identity string) map[
 func (s *Server) processRegisteredInvite(
 	ctx context.Context,
 	cc *sipInbound,
-	from, to URI,
+	from, to sip.Uri,
 	log logger.Logger,
 ) bool {
 	callerIdentity := from.User
@@ -133,7 +160,7 @@ func (s *Server) handleInternalCall(
 	callerIdentity, calleeIdentity, orgID string,
 	log logger.Logger,
 ) {
-	roomName := fmt.Sprintf("call-%s-%s-%d", callerIdentity, calleeIdentity, time.Now().Unix())
+	roomName := fmt.Sprintf("call-%s-%s-%d", extensionFromIdentity(callerIdentity), extensionFromIdentity(calleeIdentity), time.Now().Unix())
 	callID := guid.New("SCL_")
 
 	log = log.WithValues("room", roomName, "callID", callID)
@@ -153,6 +180,9 @@ func (s *Server) handleInternalCall(
 	// Invite callee into the room via CreateSIPParticipant
 	// This sends an INVITE to the callee's deskphone
 	calleeAddr := calleeFields["nat_ip"] + ":" + calleeFields["nat_port"]
+	callerExt := extensionFromIdentity(callerIdentity)
+	callerDisplay := s.displayName(ctx, callerIdentity)
+	calleeDisplay := s.displayName(ctx, calleeIdentity)
 
 	go func() {
 		_, err := s.cli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
@@ -160,10 +190,10 @@ func (s *Server) handleInternalCall(
 			Address:               calleeAddr,
 			Transport:             livekit.SIPTransport_SIP_TRANSPORT_TLS,
 			CallTo:                calleeIdentity,
-			Number:                callerIdentity,
+			Number:                callerExt,
 			RoomName:              roomName,
 			ParticipantIdentity:   calleeIdentity,
-			ParticipantName:       calleeIdentity,
+			ParticipantName:       calleeDisplay,
 			WaitUntilAnswered:     false,
 		})
 		if err != nil {
@@ -173,15 +203,7 @@ func (s *Server) handleInternalCall(
 		}
 	}()
 
-	// Now accept the caller's INVITE and join them to the same room.
-	// We use DispatchAccept with the room config to let the existing
-	// inbound call machinery handle media bridging.
-	// This is done by returning the dispatch result back to processInvite.
-	// But since we're handling this ourselves, we need to directly join.
-
-	// For now: accept the call and connect caller to the room.
-	// The inbound call machinery needs the dispatch result.
-	// We store it so processInvite can pick it up.
+	// Accept the caller and join them to the room
 	cc.soniqDispatch = &CallDispatch{
 		Result:    DispatchAccept,
 		ProjectID: orgID,
@@ -189,7 +211,7 @@ func (s *Server) handleInternalCall(
 			RoomName: roomName,
 			Participant: ParticipantConfig{
 				Identity: callerIdentity,
-				Name:     callerIdentity,
+				Name:     callerDisplay,
 			},
 		},
 		EnabledFeatures: []livekit.SIPFeature{},
@@ -208,7 +230,7 @@ func (s *Server) handleExternalCall(
 	log logger.Logger,
 ) {
 	roomName := fmt.Sprintf("call-%s-%s-%d",
-		callerIdentity,
+		extensionFromIdentity(callerIdentity),
 		strings.ReplaceAll(destination, "+", ""),
 		time.Now().Unix(),
 	)
@@ -221,9 +243,11 @@ func (s *Server) handleExternalCall(
 	// TODO: LCR lookup for cheapest trunk
 	// For now, use OneHub as default outbound trunk
 	trunkAddr := "34.147.235.69:5060" // OneHub
-	callerNumber := "" // TODO: look up org's CLI from sip_credentials/org settings
+	callerExt := extensionFromIdentity(callerIdentity)
+	callerDisplay := s.displayName(ctx, callerIdentity)
 
 	// Look up the org's outbound CLI
+	callerNumber := callerExt // default to extension
 	if s.registrar != nil {
 		cred, err := s.registrar.lookupCredentials(ctx, callerIdentity)
 		if err == nil && cred != nil {
@@ -235,7 +259,7 @@ func (s *Server) handleExternalCall(
 		}
 	}
 	if callerNumber == "" {
-		callerNumber = callerIdentity
+		callerNumber = callerExt
 	}
 
 	// Invite the PSTN side via CreateSIPParticipant
@@ -266,7 +290,7 @@ func (s *Server) handleExternalCall(
 			RoomName: roomName,
 			Participant: ParticipantConfig{
 				Identity: callerIdentity,
-				Name:     callerIdentity,
+				Name:     callerDisplay,
 			},
 		},
 		EnabledFeatures: []livekit.SIPFeature{},
