@@ -160,7 +160,7 @@ func (s *Server) handleInternalCall(
 	callerIdentity, calleeIdentity, orgID string,
 	log logger.Logger,
 ) {
-	roomName := fmt.Sprintf("call-%s-%s-%d", extensionFromIdentity(callerIdentity), extensionFromIdentity(calleeIdentity), time.Now().Unix())
+	roomName := fmt.Sprintf("call-%s-%s-%d", callerIdentity, calleeIdentity, time.Now().Unix())
 	callID := guid.New("SCL_")
 
 	log = log.WithValues("room", roomName, "callID", callID)
@@ -230,7 +230,7 @@ func (s *Server) handleExternalCall(
 	log logger.Logger,
 ) {
 	roomName := fmt.Sprintf("call-%s-%s-%d",
-		extensionFromIdentity(callerIdentity),
+		callerIdentity,
 		strings.ReplaceAll(destination, "+", ""),
 		time.Now().Unix(),
 	)
