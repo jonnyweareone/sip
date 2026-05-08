@@ -70,6 +70,9 @@ type Client struct {
 	getIOClient  GetIOInfoClient
 	getSipClient GetSipClientFunc
 	getRoom      GetRoomFunc
+
+	// SONIQ: resolve registered deskphone endpoints
+	registrar *Registrar
 }
 
 type ClientOption func(c *Client)
@@ -182,8 +185,39 @@ func (c *Client) createSIPParticipant(ctx context.Context, req *rpc.InternalCrea
 	req.Upgrade()
 	if req.CallTo == "" {
 		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "call-to number must be set")
-	} else if req.Address == "" {
-		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "trunk adresss must be set")
+	}
+
+	// SONIQ: Check if CallTo is a registered deskphone endpoint.
+	// If so, resolve the NAT contact from Redis and override Address/Transport.
+	// This allows CreateSIPParticipant to invite a deskphone into any room
+	// without needing a trunk — the phone IS the endpoint.
+	if c.registrar != nil {
+		contactURI, fields, err := c.registrar.ResolveEndpoint(ctx, req.CallTo)
+		if err != nil {
+			c.log.Warnw("SONIQ endpoint lookup failed, falling through to trunk", err, "callTo", req.CallTo)
+		} else if contactURI != "" {
+			// Registered endpoint found — rewrite the request to target the phone directly
+			c.log.Infow("SONIQ: routing to registered endpoint",
+				"callTo", req.CallTo,
+				"contact", contactURI,
+				"nodeID", fields["node_id"],
+			)
+			// Parse contact_uri: "sip:identity@ip:port;transport=tls"
+			// Set Address to the NAT IP:port, transport to TLS
+			req.Address = fields["nat_ip"] + ":" + fields["nat_port"]
+			req.Transport = livekit.SIPTransport_SIP_TRANSPORT_TLS
+			// No trunk auth needed for registered devices
+			req.Username = ""
+			req.Password = ""
+			if req.Number == "" {
+				req.Number = req.CallTo
+			}
+			// Fall through to normal outbound call creation
+		}
+	}
+
+	if req.Address == "" {
+		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "trunk address must be set")
 	} else if req.Number == "" {
 		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "trunk outbound number must be set")
 	} else if req.RoomName == "" {

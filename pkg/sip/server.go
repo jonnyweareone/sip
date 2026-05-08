@@ -17,12 +17,14 @@ package sip
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
@@ -164,6 +166,9 @@ type Server struct {
 	cli *Client // optional, for outbound reinvite handling
 
 	res mediaRes
+
+	// SONIQ: deskphone registrar
+	registrar *Registrar
 }
 
 type inProgressInvite struct {
@@ -184,6 +189,12 @@ func WithGetRoomServer(fn GetRoomFunc) ServerOption {
 func WithClient(cli *Client) ServerOption {
 	return func(s *Server) {
 		s.cli = cli
+	}
+}
+
+func WithRegistrar(reg *Registrar) ServerOption {
+	return func(s *Server) {
+		s.registrar = reg
 	}
 }
 
@@ -320,6 +331,14 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 	s.sipSrv.OnNoRoute(s.OnNoRoute)
 	s.sipUnhandled = unhandled
 
+	// SONIQ: wire REGISTER handler for deskphone registration
+	if s.registrar != nil {
+		s.sipSrv.OnRegister(func(_ *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+			s.registrar.OnRegister(req, tx)
+		})
+		s.log.Infow("SONIQ registrar wired to SIP server")
+	}
+
 	listenIP := s.conf.ListenIP
 	if listenIP == "" {
 		listenIP = "0.0.0.0"
@@ -343,6 +362,25 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 		}
 	}
 
+	// SONIQ: Start registration mTLS listener on port 5080
+	// Uses RequireAndVerifyClientCert with the SONIQ CA.
+	// Only phones with a valid client cert can connect.
+	if tlsConf != nil && s.conf.SONIQ != nil && s.registrar != nil {
+		regTLS, err := s.buildRegTLSConfig(tlsConf)
+		if err != nil {
+			return fmt.Errorf("SONIQ registration TLS config: %w", err)
+		}
+		regPort := uint16(s.conf.SONIQ.RegPortListen)
+		addrReg := netip.AddrPortFrom(ip, regPort)
+		if err := s.startTLS(addrReg, regTLS); err != nil {
+			return err
+		}
+		s.log.Infow("SONIQ registration listener started (mTLS)",
+			"port", regPort,
+			"ca", s.conf.SONIQ.CACertFile,
+		)
+	}
+
 	return nil
 }
 
@@ -362,6 +400,36 @@ func (s *Server) Stop() {
 	for _, l := range s.sipListeners {
 		_ = l.Close()
 	}
+}
+
+// buildRegTLSConfig creates a TLS config for the SONIQ registration port (5080)
+// with mutual TLS — RequireAndVerifyClientCert using the SONIQ CA.
+func (s *Server) buildRegTLSConfig(baseTLS *tls.Config) (*tls.Config, error) {
+	soniq := s.conf.SONIQ
+	if soniq.CACertFile == "" {
+		// No CA configured — fall back to server-only TLS (no client cert required).
+		// Still works but without device identity verification.
+		s.log.Warnw("SONIQ CA cert not configured, registration port will not require client certs", nil)
+		return baseTLS, nil
+	}
+
+	caPEM, err := os.ReadFile(soniq.CACertFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading SONIQ CA cert %s: %w", soniq.CACertFile, err)
+	}
+
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("failed to parse SONIQ CA cert from %s", soniq.CACertFile)
+	}
+
+	// Clone the base TLS config (server cert, cipher suites, etc.)
+	// and add mTLS requirement
+	regTLS := baseTLS.Clone()
+	regTLS.ClientAuth = tls.RequireAndVerifyClientCert
+	regTLS.ClientCAs = caPool
+
+	return regTLS, nil
 }
 
 func (s *Server) RegisterTransferSIPParticipant(sipCallID LocalTag, i *inboundCall) error {

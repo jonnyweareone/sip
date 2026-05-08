@@ -1,0 +1,46 @@
+# SONIQ LiveKit SIP Config — sip-lhr-1
+# Deployed on: sip-lhr-1 (192.248.144.239, TS 100.121.140.54)
+
+api_key: ${LIVEKIT_API_KEY}
+api_secret: ${LIVEKIT_API_SECRET}
+ws_url: ws://100.121.140.54:7880
+
+redis:
+  address: regular-goshawk-96620.upstash.io:6379
+  username: default
+  password: ${UPSTASH_PASSWORD}
+  use_tls: true
+
+sip_port: 5060
+health_port: 8080
+prometheus_port: 6789
+
+use_external_ip: true
+
+tls:
+  port: 5061
+  port_listen: 5061
+  certs:
+    - cert_file: /etc/livekit-sip/tls/fullchain.pem
+      key_file: /etc/livekit-sip/tls/privkey.pem
+  min_version: "tls1.2"
+
+rtp_port:
+  start: 10000
+  end: 20000
+
+# SONIQ deskphone registration (mTLS) + action URLs
+soniq:
+  reg_port: 5080
+  reg_port_listen: 5080
+  ca_cert_file: /etc/livekit-sip/soniq-ca.pem  # SONIQ CA for device client certs
+  supabase_url: https://dtosgubmmdqxbeirtbom.supabase.co
+  supabase_anon_key: ${SUPABASE_ANON_KEY}
+  node_id: lhr-1
+  action_port: 8090
+  ably_api_key: ${ABLY_API_KEY}
+  reg_expiry: 60
+  realm: sip.soniqlabs.co.uk
+
+logging:
+  level: info

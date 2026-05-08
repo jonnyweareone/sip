@@ -32,6 +32,8 @@ import (
 
 	"github.com/livekit/sipgo/transport"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	msdk "github.com/livekit/media-sdk"
@@ -70,11 +72,28 @@ type Service struct {
 
 	mu               sync.Mutex
 	pendingTransfers map[LocalTag]*PendingTransfer
+
+	// SONIQ
+	registrar    *Registrar
+	actionServer *ActionServer
 }
 
 type GetIOInfoClient func(projectID string) rpc.IOInfoClient
 
-func NewService(region string, conf *config.Config, mon *stats.Monitor, log logger.Logger, getIOClient GetIOInfoClient) (*Service, error) {
+// ServiceOption allows injecting dependencies into NewService.
+type ServiceOption func(s *Service)
+
+// WithRedisClient injects a Redis client for SONIQ registrar endpoint storage.
+func WithRedisClient(rc goredis.UniversalClient) ServiceOption {
+	return func(s *Service) {
+		if s.conf.SONIQ != nil && rc != nil {
+			s.registrar = NewRegistrar(s.conf, s.log, rc)
+			s.actionServer = NewActionServer(s.conf.SONIQ, s.log, rc)
+		}
+	}
+}
+
+func NewService(region string, conf *config.Config, mon *stats.Monitor, log logger.Logger, getIOClient GetIOInfoClient, opts ...ServiceOption) (*Service, error) {
 	if log == nil {
 		log = logger.GetLogger()
 	}
@@ -95,6 +114,15 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 		cli:              cli,
 		srv:              NewServer(region, conf, log, mon, getIOClient, WithClient(cli)),
 		pendingTransfers: make(map[LocalTag]*PendingTransfer),
+	}
+	// Apply service options (e.g. WithRedisClient for SONIQ registrar)
+	for _, opt := range opts {
+		opt(s)
+	}
+	// If registrar was created by options, wire it into the server and client
+	if s.registrar != nil {
+		s.srv.registrar = s.registrar
+		s.cli.registrar = s.registrar
 	}
 	var err error
 	s.sconf, err = GetServiceConfig(s.conf)
@@ -186,6 +214,9 @@ func (s *Service) ActiveCalls() ActiveCalls {
 }
 
 func (s *Service) Stop() {
+	if s.actionServer != nil {
+		s.actionServer.Stop()
+	}
 	s.cli.Stop()
 	s.srv.Stop()
 	s.mon.Stop()
@@ -197,6 +228,11 @@ func (s *Service) Stop() {
 func (s *Service) SetHandler(handler Handler) {
 	s.srv.SetHandler(handler)
 	s.cli.SetHandler(handler)
+}
+
+// Registrar returns the SONIQ registrar, or nil if not configured.
+func (s *Service) Registrar() *Registrar {
+	return s.registrar
 }
 
 func (s *Service) Start() error {
@@ -305,6 +341,14 @@ func (s *Service) Start() error {
 	if err := s.srv.Start(ua, s.sconf, tlsConf, s.cli.OnRequest); err != nil {
 		return err
 	}
+
+	// SONIQ: Start action URL server for Yealink button presses
+	if s.actionServer != nil {
+		if err := s.actionServer.Start(); err != nil {
+			return err
+		}
+	}
+
 	s.log.Debugw("sip service ready")
 	return nil
 }

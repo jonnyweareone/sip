@@ -128,7 +128,39 @@ type Config struct {
 		// InboundWaitACK forces SIP to wait for an ACK to 200 OK before proceeding with the call.
 		InboundWaitACK bool `yaml:"inbound_wait_ack"`
 	} `yaml:"experimental"`
+
+	// SONIQ: Persistent deskphone endpoint registration
+	SONIQ *SONIQConfig `yaml:"soniq"`
 }
+
+// SONIQConfig holds configuration for SONIQ deskphone registration and action URLs.
+type SONIQConfig struct {
+	// Registration listener port for deskphones (mTLS). Default 5080.
+	RegPort       int    `yaml:"reg_port"`
+	RegPortListen int    `yaml:"reg_port_listen"`
+	// CA certificate file for validating deskphone client certs
+	CACertFile string `yaml:"ca_cert_file"` // e.g. /etc/livekit-sip/soniq-ca.pem
+	// Supabase PostgREST URL for sip_credentials lookup
+	SupabaseURL     string `yaml:"supabase_url"`
+	SupabaseAnonKey string `yaml:"supabase_anon_key"`
+	// Node identity for HA (e.g. "lhr-1", "man-1")
+	NodeID string `yaml:"node_id"`
+	// Action URL HTTP port for Yealink button presses
+	ActionPort int `yaml:"action_port"` // default 8090
+	// Ably API key for publishing action events to soniq-router
+	AblyAPIKey string `yaml:"ably_api_key"`
+	// Registration expiry in seconds. Default 60. Redis TTL = 1.5x this value.
+	RegExpiry int `yaml:"reg_expiry"`
+	// SIP realm (used in Contact URIs)
+	Realm string `yaml:"realm"` // default "sip.soniqlabs.co.uk"
+}
+
+const (
+	DefaultRegPort    int = 5080
+	DefaultActionPort int = 8090
+	DefaultRegExpiry  int = 60
+	DefaultSONIQRealm     = "sip.soniqlabs.co.uk"
+)
 
 func NewConfig(confString string) (*Config, error) {
 	conf := &Config{
@@ -187,6 +219,25 @@ func (c *Config) Init() error {
 
 	if c.MediaUseExternalIP && c.MediaNAT1To1IP != "" {
 		return fmt.Errorf("media_use_external_ip and media_nat_1_to_1_ip can not both be set")
+	}
+
+	// SONIQ defaults
+	if sc := c.SONIQ; sc != nil {
+		if sc.RegPort == 0 {
+			sc.RegPort = DefaultRegPort
+		}
+		if sc.RegPortListen == 0 {
+			sc.RegPortListen = sc.RegPort
+		}
+		if sc.ActionPort == 0 {
+			sc.ActionPort = DefaultActionPort
+		}
+		if sc.RegExpiry == 0 {
+			sc.RegExpiry = DefaultRegExpiry
+		}
+		if sc.Realm == "" {
+			sc.Realm = DefaultSONIQRealm
+		}
 	}
 
 	return nil

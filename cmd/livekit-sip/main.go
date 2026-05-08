@@ -99,7 +99,7 @@ func runService(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
-	sipsrv, err := sip.NewService("", conf, mon, log, func(projectID string) rpc.IOInfoClient { return psrpcClient })
+	sipsrv, err := sip.NewService("", conf, mon, log, func(projectID string) rpc.IOInfoClient { return psrpcClient }, sip.WithRedisClient(rc))
 	if err != nil {
 		return err
 	}
