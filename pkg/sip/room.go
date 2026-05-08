@@ -328,7 +328,7 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 			// SONIQ: When the last remote participant leaves, close our room connection.
 			// This triggers the outbound call's Disconnected() channel → sends BYE.
 			if room := r.Room(); room != nil {
-				remotes := room.GetParticipants()
+				remotes := room.GetRemoteParticipants()
 				if len(remotes) == 0 {
 					r.roomLog.Infow("SONIQ: last remote participant left, closing room connection",
 						"leftParticipant", rp.Identity())
