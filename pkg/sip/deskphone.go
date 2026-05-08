@@ -248,46 +248,33 @@ func (s *Server) handleExternalCall(
 	// TODO: LCR lookup for cheapest trunk
 	// For now, use OneHub as default outbound trunk
 	trunkAddr := "34.147.235.69:5060" // OneHub
-	callerExt := extensionFromIdentity(callerIdentity)
 	callerDisplay := s.displayName(ctx, callerIdentity)
 
-	// Look up the org's outbound CLI
-	callerNumber := callerExt // default to extension
-	if s.registrar != nil {
-		cred, err := s.registrar.lookupCredentials(ctx, callerIdentity)
-		if err == nil && cred != nil {
-			// Use the extension part as the from number for now
-			parts := strings.SplitN(cred.Username, ".", 2)
-			if len(parts) > 0 {
-				callerNumber = parts[0]
-			}
-		}
-	}
-	if callerNumber == "" {
-		callerNumber = callerExt
-	}
+	// Outbound CLI — must be a real number the trunk accepts.
+	// TODO: look up org's outbound CLI from org_settings or sip_trunks table
+	callerNumber := "+442046283328" // SONIQ main number for now
 
-	// Invite the PSTN side via CreateSIPParticipant
-	go func() {
-		_, err := s.cli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
-			SipCallId:           guid.New("SCL_"),
-			Address:             trunkAddr,
-			Transport:           livekit.SIPTransport_SIP_TRANSPORT_UDP,
-			CallTo:              destination,
-			Number:              callerNumber,
-			RoomName:            roomName,
-			ParticipantIdentity: fmt.Sprintf("pstn-%s", destination),
-			ParticipantName:     destination,
-			WaitUntilAnswered:   false,
-		})
-		if err != nil {
-			log.Errorw("failed to create PSTN participant", err)
-		} else {
-			log.Infow("PSTN participant created", "destination", destination, "trunk", trunkAddr)
-		}
-	}()
+	// Invite the PSTN side SYNCHRONOUSLY — caller hears ringback until remote answers
+	log.Infow("ringing caller while inviting PSTN", "trunk", trunkAddr, "cli", callerNumber)
+	_, err := s.cli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
+		SipCallId:           guid.New("SCL_"),
+		Address:             trunkAddr,
+		Transport:           livekit.SIPTransport_SIP_TRANSPORT_UDP,
+		CallTo:              destination,
+		Number:              callerNumber,
+		RoomName:            roomName,
+		ParticipantIdentity: fmt.Sprintf("pstn-%s", destination),
+		ParticipantName:     destination,
+		WaitUntilAnswered:   true,
+	})
+	if err != nil {
+		log.Errorw("PSTN call failed", err, "destination", destination)
+		cc.RespondAndDrop(503, "Service Unavailable")
+		return
+	}
+	log.Infow("PSTN answered, accepting caller", "destination", destination)
 
-	// Accept the caller and join them to the room
+	// PSTN answered — now accept the caller
 	cc.soniqDispatch = &CallDispatch{
 		Result:    DispatchAccept,
 		ProjectID: orgID,
