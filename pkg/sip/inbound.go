@@ -838,6 +838,11 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 		}
 		rawSDP := req.Body()
 
+		// SONIQ: Log the phone's raw SDP offer before any rewriting
+		if c.cc.natPublicIP != "" {
+			log.Infow("SDP offer from deskphone (raw)", "sdp", string(rawSDP))
+		}
+
 		// SONIQ: Fix NAT'd SDP for registered deskphones.
 		// Replace private LAN IPs with the phone's public NAT IP.
 		if c.cc.natPublicIP != "" {
