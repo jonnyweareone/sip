@@ -358,6 +358,41 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 
 	from, to := cc.From(), cc.To()
 
+	// ── SONIQ: Check if this INVITE is from a registered deskphone ──
+	// If so, route internally (extension→extension) or externally (PSTN)
+	// bypassing trunk auth and dispatch rules entirely.
+	if s.registrar != nil && s.processRegisteredInvite(ctx, cc, from, to, log) {
+		if cc.soniqDispatch == nil {
+			return nil // error already sent (e.g. callee not found)
+		}
+		// soniqDispatch is set — create the call and let handleInvite
+		// pick up the pre-computed dispatch (skipping DispatchCall)
+		cmon := s.mon.NewCall(stats.Inbound, from.Host, to.Host)
+		cmon.InviteReq()
+		defer cmon.SessionDur()()
+		state := NewCallState(s.getIOClient(cc.soniqDispatch.ProjectID), &livekit.SIPCallInfo{
+			CallId:              string(cc.ID()),
+			Region:              s.region,
+			RoomName:            cc.soniqDispatch.Room.RoomName,
+			ParticipantIdentity: cc.soniqDispatch.Room.Participant.Identity,
+			CallDirection:       livekit.SIPCallDirection_SCD_OUTBOUND,
+			CreatedAtNs:         time.Now().UnixNano(),
+		})
+		state.Flush(ctx)
+		callInfo := &rpc.SIPCall{
+			LkCallId:  string(cc.ID()),
+			SipCallId: cc.SIPCallID(),
+			SourceIp:  src.Addr().String(),
+			From:      ToSIPUri("", from),
+			To:        ToSIPUri("", to),
+		}
+		call := s.newInboundCall(ctx, tid, log, cmon, cc, callInfo, state, start, nil)
+		cc.SetCall(call)
+		call.joinDur = cmon.JoinDur()
+		call.sigTs.InviteTime = start
+		return call.handleInvite(call.ctx, tid, req, "", s.conf)
+	}
+
 	cmon := s.mon.NewCall(stats.Inbound, from.Host, to.Host)
 	cmon.InviteReq()
 	defer cmon.SessionDur()()
@@ -707,16 +742,24 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 
 	c.cc.StartRinging()
 	c.sigTs.RingingTime = time.Now()
-	// Send initial request. In the best case scenario, we will immediately get a room name to join.
-	// Otherwise, we could even learn that this number is not allowed and reject the call, or ask for pin if required.
-	tdisp := c.mon.StageDurTimer("eval-dispatch")
-	disp := c.s.handler.DispatchCall(ctx, &CallInfo{
-		TrunkID: trunkID,
-		Call:    c.call,
-		Pin:     "",
-		NoPin:   false,
-	})
-	tdisp()
+
+	// ── SONIQ: Use pre-computed dispatch for registered deskphone calls ──
+	var disp CallDispatch
+	if c.cc.soniqDispatch != nil {
+		disp = *c.cc.soniqDispatch
+		c.log().Infow("using SONIQ deskphone dispatch", "room", disp.Room.RoomName)
+	} else {
+		// Send initial request. In the best case scenario, we will immediately get a room name to join.
+		// Otherwise, we could even learn that this number is not allowed and reject the call, or ask for pin if required.
+		tdisp := c.mon.StageDurTimer("eval-dispatch")
+		disp = c.s.handler.DispatchCall(ctx, &CallInfo{
+			TrunkID: trunkID,
+			Call:    c.call,
+			Pin:     "",
+			NoPin:   false,
+		})
+		tdisp()
+	}
 	if disp.MediaConfig == nil {
 		disp.MediaConfig = &livekit.SIPMediaConfig{}
 	}
@@ -1612,6 +1655,9 @@ type sipInbound struct {
 	ringing         chan struct{}
 	acked           core.Fuse
 	call            *inboundCall
+
+	// SONIQ: populated by processRegisteredInvite for deskphone calls
+	soniqDispatch *CallDispatch
 }
 
 func (c *sipInbound) SetCall(call *inboundCall) {
