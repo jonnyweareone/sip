@@ -21,7 +21,7 @@ tls:
   port: 5061
   port_listen: 5061
   certs:
-    - cert_file: /opt/soniq-certs/server/server.crt
+    - cert_file: /opt/soniq-certs/server/server-chain.crt  # server cert + CA chain
       key_file: /opt/soniq-certs/server/server.key
   min_version: "tls1.2"
 

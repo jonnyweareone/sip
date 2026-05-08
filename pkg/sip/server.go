@@ -423,10 +423,9 @@ func (s *Server) buildRegTLSConfig(baseTLS *tls.Config) (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to parse SONIQ CA cert from %s", soniq.CACertFile)
 	}
 
-	// Clone the base TLS config (server cert, cipher suites, etc.)
-	// and add mTLS — VerifyClientCertIfGiven allows phones without certs
-	// to still connect (they'll be verified by Supabase lookup instead).
-	// Switch to RequireAndVerifyClientCert once cert provisioning is confirmed working.
+	// Clone the base TLS config (server cert + CA chain, cipher suites, etc.)
+	// VerifyClientCertIfGiven = validate client cert if presented, but don't require it.
+	// Phones with certs get mTLS + digest (strongest). Phones without get digest only.
 	regTLS := baseTLS.Clone()
 	regTLS.ClientAuth = tls.VerifyClientCertIfGiven
 	regTLS.ClientCAs = caPool
