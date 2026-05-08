@@ -168,9 +168,6 @@ func (s *Server) handleInternalCall(
 	log = log.WithValues("room", roomName, "callID", callID)
 	log.Infow("creating internal call room")
 
-	// Ring the caller (they hear ringback)
-	cc.StartRinging()
-
 	// Resolve callee's NAT contact from Redis
 	calleeContact, calleeFields, err := s.registrar.ResolveEndpoint(ctx, calleeIdentity)
 	if err != nil || calleeContact == "" {
@@ -179,35 +176,39 @@ func (s *Server) handleInternalCall(
 		return
 	}
 
-	// Invite callee into the room via CreateSIPParticipant
-	// This sends an INVITE to the callee's deskphone
 	calleeAddr := calleeFields["nat_ip"] + ":" + calleeFields["nat_port"]
 	callerExt := extensionFromIdentity(callerIdentity)
 	callerDisplay := s.displayName(ctx, callerIdentity)
 	calleeDisplay := s.displayName(ctx, calleeIdentity)
 
-	go func() {
-		callerDisplayName := callerDisplay // "Jonny Robinson (1000)" — shown on Barry's phone
-		_, err := s.cli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
-			SipCallId:             guid.New("SCL_"),
-			Address:               calleeAddr,
-			Transport:             livekit.SIPTransport_SIP_TRANSPORT_TLS,
-			CallTo:                calleeIdentity,
-			Number:                callerExt,
-			DisplayName:           &callerDisplayName,
-			RoomName:              roomName,
-			ParticipantIdentity:   calleeIdentity,
-			ParticipantName:       calleeDisplay,
-			WaitUntilAnswered:     false,
-		})
-		if err != nil {
-			log.Errorw("failed to invite callee", err)
-		} else {
-			log.Infow("callee invited", "callee", calleeIdentity, "address", calleeAddr)
-		}
-	}()
+	// Send 180 Ringing to the caller — they hear ringback tone while we invite the callee
+	cc.StartRinging()
+	log.Infow("ringing caller while inviting callee", "calleeAddr", calleeAddr)
 
-	// Accept the caller and join them to the room
+	// Invite callee SYNCHRONOUSLY — caller hears ringback until callee answers.
+	// CreateSIPParticipant blocks until the callee's phone answers (200 OK)
+	// or times out. The caller's TLS connection stays open with 180 Ringing.
+	callerDisplayName := callerDisplay
+	_, err = s.cli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
+		SipCallId:           guid.New("SCL_"),
+		Address:             calleeAddr,
+		Transport:           livekit.SIPTransport_SIP_TRANSPORT_TLS,
+		CallTo:              calleeIdentity,
+		Number:              callerExt,
+		DisplayName:         &callerDisplayName,
+		RoomName:            roomName,
+		ParticipantIdentity: calleeIdentity,
+		ParticipantName:     calleeDisplay,
+		WaitUntilAnswered:   true,
+	})
+	if err != nil {
+		log.Errorw("callee did not answer", err, "callee", calleeIdentity)
+		cc.RespondAndDrop(480, "Temporarily Unavailable")
+		return
+	}
+	log.Infow("callee answered, accepting caller", "callee", calleeIdentity)
+
+	// Callee answered — now accept the caller and join them to the same room
 	cc.soniqDispatch = &CallDispatch{
 		Result:    DispatchAccept,
 		ProjectID: orgID,
