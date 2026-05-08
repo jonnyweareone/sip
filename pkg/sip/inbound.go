@@ -836,6 +836,14 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 			log.Infow("no offer type specified")
 		}
 		rawSDP := req.Body()
+
+		// SONIQ: Fix NAT'd SDP for registered deskphones.
+		// Replace private LAN IPs with the phone's public NAT IP.
+		if c.cc.natPublicIP != "" {
+			rawSDP = fixNATedSDP(rawSDP, c.cc.natPublicIP)
+			log.Infow("rewrote NAT'd SDP", "publicIP", c.cc.natPublicIP)
+		}
+
 		tmedia := c.mon.StageDurTimer("start-media")
 		answerData, err := c.runMediaConn(tid, rawSDP, m, conf, disp.EnabledFeatures, disp.FeatureFlags)
 		tmedia()
@@ -1658,6 +1666,8 @@ type sipInbound struct {
 
 	// SONIQ: populated by processRegisteredInvite for deskphone calls
 	soniqDispatch *CallDispatch
+	// SONIQ: public NAT IP for SDP rewriting (empty = no rewrite needed)
+	natPublicIP string
 }
 
 func (c *sipInbound) SetCall(call *inboundCall) {

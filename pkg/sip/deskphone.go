@@ -90,6 +90,9 @@ func (s *Server) processRegisteredInvite(
 	)
 	log.Infow("deskphone INVITE — registered endpoint call")
 
+	// Store caller's NAT public IP for SDP rewriting
+	cc.natPublicIP = callerFields["nat_ip"]
+
 	// Send 100 Trying
 	cc.Processing()
 
@@ -181,12 +184,14 @@ func (s *Server) handleInternalCall(
 	calleeDisplay := s.displayName(ctx, calleeIdentity)
 
 	go func() {
+		callerDisplayName := callerDisplay // "Jonny Robinson (1000)" — shown on Barry's phone
 		_, err := s.cli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
 			SipCallId:             guid.New("SCL_"),
 			Address:               calleeAddr,
 			Transport:             livekit.SIPTransport_SIP_TRANSPORT_TLS,
 			CallTo:                calleeIdentity,
 			Number:                callerExt,
+			DisplayName:           &callerDisplayName,
 			RoomName:              roomName,
 			ParticipantIdentity:   calleeIdentity,
 			ParticipantName:       calleeDisplay,
@@ -294,4 +299,57 @@ func (s *Server) handleExternalCall(
 		MaxCallDuration: 4 * time.Hour,
 		MediaConfig:     &livekit.SIPMediaConfig{},
 	}
+}
+
+// fixNATedSDP rewrites private IP addresses in SDP to the phone's public NAT IP.
+// This is the Go equivalent of Kamailio's fix_nated_sdp().
+//
+// Phones behind NAT advertise their private LAN IP in SDP:
+//   c=IN IP4 192.168.0.170
+//   o=- 123 456 IN IP4 192.168.0.170
+//
+// We replace with the public IP from the SIP Via received parameter:
+//   c=IN IP4 81.108.56.41
+//   o=- 123 456 IN IP4 81.108.56.41
+//
+// This works for all phones behind any NAT — home routers, office firewalls,
+// carrier-grade NAT. The public IP is always available from the Via header.
+func fixNATedSDP(sdpBytes []byte, publicIP string) []byte {
+	if publicIP == "" {
+		return sdpBytes
+	}
+	lines := strings.Split(string(sdpBytes), "\r\n")
+	for i, line := range lines {
+		// Fix connection line: c=IN IP4 192.168.x.x
+		if strings.HasPrefix(line, "c=IN IP4 ") {
+			oldIP := strings.TrimPrefix(line, "c=IN IP4 ")
+			if isPrivateIP(oldIP) {
+				lines[i] = "c=IN IP4 " + publicIP
+			}
+		}
+		// Fix origin line: o=- 123 456 IN IP4 192.168.x.x
+		if strings.HasPrefix(line, "o=") && strings.Contains(line, "IN IP4 ") {
+			parts := strings.Split(line, " IN IP4 ")
+			if len(parts) == 2 && isPrivateIP(parts[1]) {
+				lines[i] = parts[0] + " IN IP4 " + publicIP
+			}
+		}
+	}
+	return []byte(strings.Join(lines, "\r\n"))
+}
+
+// isPrivateIP checks if an IP string is a private/local address.
+func isPrivateIP(ip string) bool {
+	return strings.HasPrefix(ip, "192.168.") ||
+		strings.HasPrefix(ip, "10.") ||
+		strings.HasPrefix(ip, "172.16.") ||
+		strings.HasPrefix(ip, "172.17.") ||
+		strings.HasPrefix(ip, "172.18.") ||
+		strings.HasPrefix(ip, "172.19.") ||
+		strings.HasPrefix(ip, "172.2") ||
+		strings.HasPrefix(ip, "172.30.") ||
+		strings.HasPrefix(ip, "172.31.") ||
+		strings.HasPrefix(ip, "169.254.") ||
+		ip == "127.0.0.1" ||
+		ip == "0.0.0.0"
 }

@@ -668,6 +668,17 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	c.mon.SDPSize(len(sdpResp), false)
 	c.log.Debugw("SDP answer", "sdp", string(sdpResp))
 
+	// SONIQ: Fix NAT'd SDP in callee's response.
+	// The callee's phone advertises its private LAN IP in SDP.
+	// Rewrite to the public NAT IP we used to reach it.
+	if addr := c.sipConf.address; addr != "" {
+		host, _, _ := net.SplitHostPort(addr)
+		if host != "" {
+			sdpResp = fixNATedSDP(sdpResp, host)
+			c.log.Infow("rewrote callee NAT'd SDP", "publicIP", host)
+		}
+	}
+
 	c.log = LoggerWithHeaders(c.log, c.cc)
 
 	mc, localSDP, err := c.media.SetAnswer(sdpOffer, sdpResp, mconf.Codecs, mconf.Encryption)
