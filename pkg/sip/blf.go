@@ -356,7 +356,6 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		User: subscriber,
 		Host: contactHost,
 		Port: contactPort,
-		UriParams: sip.HeaderParams{"transport": "tls"},
 	}
 
 	req := sip.NewRequest(sip.NOTIFY, reqURI)
