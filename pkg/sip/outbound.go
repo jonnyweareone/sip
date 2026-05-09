@@ -1085,6 +1085,18 @@ func (c *sipOutbound) attemptInvite(ctx context.Context, callID sip.CallIDHeader
 		req.PrependHeader(sip.NewHeader("Route", route))
 	}
 
+	// SONIQ: Force the transport layer to use the Request-URI host for connection lookup.
+	// Without this, sipgo resolves the destination differently for TLS, sometimes
+	// using the phone's private IP (from Contact). SetDestination ensures sipgo
+	// finds the EXISTING TLS connection in its pool (keyed by RemoteAddr = NAT IP).
+	if to.Address.Host != "" {
+		dest := to.Address.Host
+		if to.Address.Port > 0 {
+			dest = fmt.Sprintf("%s:%d", to.Address.Host, to.Address.Port)
+		}
+		req.SetDestination(dest)
+	}
+
 	tx, err := c.c.sipCli.TransactionRequest(req)
 	if err != nil {
 		return nil, nil, err
