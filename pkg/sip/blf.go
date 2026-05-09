@@ -315,40 +315,62 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 	// Build dialog-info XML body
 	xml := b.buildDialogInfoXML(target, presence)
 
-	// Parse contact URI for the request target
-	// Contact is like: <sip:1000.soniq-master@192.168.0.170:50030;transport=TLS>
-	// We need to send to the phone's address
-	toURI := sip.Uri{
-		User: target,
-		Host: b.conf.Realm,
+	// Parse the subscriber's contact URI to build the NOTIFY request-URI
+	// The contact is like: <sip:1000.soniq-master@192.168.0.170:50030;transport=TLS>
+	// We must send to this address so sipgo uses the existing TLS connection
+	parsedContact := contactURI
+	parsedContact = strings.TrimPrefix(parsedContact, "<")
+	parsedContact = strings.TrimSuffix(parsedContact, ">")
+	// Strip params after semicolon for the URI
+	contactAddr := parsedContact
+	if idx := strings.Index(contactAddr, ";"); idx > 0 {
+		contactAddr = contactAddr[:idx]
 	}
-	fromURI := sip.Uri{
-		User: target,
-		Host: b.conf.Realm,
+	// Parse sip:user@host:port
+	contactAddr = strings.TrimPrefix(contactAddr, "sip:")
+	contactAddr = strings.TrimPrefix(contactAddr, "sips:")
+	contactParts := strings.SplitN(contactAddr, "@", 2)
+	contactHost := ""
+	contactPort := 0
+	if len(contactParts) == 2 {
+		hostPort := contactParts[1]
+		if hp := strings.SplitN(hostPort, ":", 2); len(hp) == 2 {
+			contactHost = hp[0]
+			contactPort, _ = strconv.Atoi(hp[1])
+		} else {
+			contactHost = hostPort
+			contactPort = 5060
+		}
 	}
 
-	// Build NOTIFY request
-	// In the NOTIFY, From = the entity being monitored (target)
-	// To = the subscriber
-	subURI := sip.Uri{
+	// But the phone is behind NAT — use the NAT IP from registration instead
+	natIP := subFields["nat_ip"]
+	natPort, _ := strconv.Atoi(subFields["nat_port"])
+	if natIP != "" && natPort > 0 {
+		contactHost = natIP
+		contactPort = natPort
+	}
+
+	// Build NOTIFY request targeting the phone's actual address
+	reqURI := sip.Uri{
 		User: subscriber,
-		Host: b.conf.Realm,
+		Host: contactHost,
+		Port: contactPort,
+		UriParams: sip.HeaderParams{"transport": "tls"},
 	}
 
-	req := sip.NewRequest(sip.NOTIFY, subURI)
-	req.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:%s@%s>", target, b.conf.Realm)))
+	req := sip.NewRequest(sip.NOTIFY, reqURI)
+	req.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:%s@%s>;tag=blf-%s", target, b.conf.Realm, target)))
 	req.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", subscriber, b.conf.Realm)))
 	req.AppendHeader(sip.NewHeader("Call-ID", subData["call_id"]))
 	req.AppendHeader(sip.NewHeader("CSeq", "1 NOTIFY"))
 	req.AppendHeader(sip.NewHeader("Event", "dialog"))
-	req.AppendHeader(sip.NewHeader("Subscription-State", "active"))
+	req.AppendHeader(sip.NewHeader("Subscription-State", "active;expires=1800"))
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/dialog-info+xml"))
+	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<sip:%s@%s:%d;transport=tls>",
 		target, b.conf.ExternalIP, b.conf.RegPortListen)))
 	req.SetBody([]byte(xml))
-
-	_ = toURI
-	_ = fromURI
 
 	b.log.Infow("Sending BLF NOTIFY via SIP",
 		"subscriber", subscriber,
