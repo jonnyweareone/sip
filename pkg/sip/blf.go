@@ -187,15 +187,20 @@ func (b *BLFManager) storeSubscription(ctx context.Context, subscriber, target, 
 		toHdr = t.Value()
 	}
 
+	// Store the source address from the SUBSCRIBE — this is the actual
+	// network address we can send NOTIFYs back to (the phone's NAT endpoint)
+	sourceAddr := req.Source()
+
 	pipe := b.redis.Pipeline()
 	pipe.HSet(ctx, subKey, map[string]interface{}{
-		"subscriber": subscriber,
-		"target":     target,
-		"call_id":    callID,
-		"from_hdr":   fromHdr,
-		"to_hdr":     toHdr,
-		"expires":    strconv.Itoa(expires),
-		"created_at": strconv.FormatInt(time.Now().Unix(), 10),
+		"subscriber":  subscriber,
+		"target":      target,
+		"call_id":     callID,
+		"from_hdr":    fromHdr,
+		"to_hdr":      toHdr,
+		"source_addr": sourceAddr,
+		"expires":     strconv.Itoa(expires),
+		"created_at":  strconv.FormatInt(time.Now().Unix(), 10),
 	})
 	pipe.Expire(ctx, subKey, ttl)
 	subsForKey := redisBLFSubsFor + target
@@ -315,44 +320,28 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 	// Build dialog-info XML body
 	xml := b.buildDialogInfoXML(target, presence)
 
-	// Parse the subscriber's contact URI to build the NOTIFY request-URI
-	// The contact is like: <sip:1000.soniq-master@192.168.0.170:50030;transport=TLS>
-	// We must send to this address so sipgo uses the existing TLS connection
-	parsedContact := contactURI
-	parsedContact = strings.TrimPrefix(parsedContact, "<")
-	parsedContact = strings.TrimSuffix(parsedContact, ">")
-	// Strip params after semicolon for the URI
-	contactAddr := parsedContact
-	if idx := strings.Index(contactAddr, ";"); idx > 0 {
-		contactAddr = contactAddr[:idx]
-	}
-	// Parse sip:user@host:port
-	contactAddr = strings.TrimPrefix(contactAddr, "sip:")
-	contactAddr = strings.TrimPrefix(contactAddr, "sips:")
-	contactParts := strings.SplitN(contactAddr, "@", 2)
-	contactHost := ""
-	contactPort := 0
-	if len(contactParts) == 2 {
-		hostPort := contactParts[1]
-		if hp := strings.SplitN(hostPort, ":", 2); len(hp) == 2 {
-			contactHost = hp[0]
-			contactPort, _ = strconv.Atoi(hp[1])
-		} else {
-			contactHost = hostPort
-			contactPort = 5060
-		}
+	// Use the source address from the SUBSCRIBE request
+	// This is the NAT endpoint the phone connected from — the transport
+	// layer has the TLS connection indexed by this address
+	sourceAddr := subData["source_addr"]
+	if sourceAddr == "" {
+		b.log.Warnw("No source_addr stored for subscription", nil, "subscriber", subscriber)
+		return
 	}
 
-	// Use the phone's PRIVATE IP from Contact header (not NAT IP)
-	// sipgo indexes TLS connections by the Contact address, so sending to the
-	// private IP will match the existing registration TLS connection.
-	// NAT IP would cause sipgo to open a new connection that can't reach the phone.
+	// Parse source address (e.g. "81.108.56.41:50034")
+	addrParts := strings.SplitN(sourceAddr, ":", 2)
+	destHost := addrParts[0]
+	destPort := 5060
+	if len(addrParts) == 2 {
+		destPort, _ = strconv.Atoi(addrParts[1])
+	}
 
-	// Build NOTIFY request targeting the phone's actual address
+	// Build NOTIFY request targeting the phone's NAT source address
 	reqURI := sip.Uri{
 		User: subscriber,
-		Host: contactHost,
-		Port: contactPort,
+		Host: destHost,
+		Port: destPort,
 	}
 
 	req := sip.NewRequest(sip.NOTIFY, reqURI)
@@ -372,7 +361,7 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		"subscriber", subscriber,
 		"target", target,
 		"state", presence.State,
-		"contactURI", contactURI,
+		"destAddr", sourceAddr,
 	)
 
 	if err := b.sipCli.WriteRequest(req); err != nil {
