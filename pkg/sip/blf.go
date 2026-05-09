@@ -354,6 +354,18 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 	}
 
 	req := sip.NewRequest(sip.NOTIFY, reqURI)
+	// Via header is REQUIRED — without it the phone silently drops the NOTIFY
+	via := &sip.ViaHeader{
+		ProtocolName:    "SIP",
+		ProtocolVersion: "2.0",
+		Transport:       "TLS",
+		Host:            b.conf.ExternalIP,
+		Port:            b.conf.RegPortListen,
+		Params:          sip.NewParams(),
+	}
+	via.Params.Add("branch", sip.GenerateBranch())
+	via.Params.Add("rport", "")
+	req.AppendHeader(via)
 	req.AppendHeader(sip.NewHeader("From", fromHdr))
 	req.AppendHeader(sip.NewHeader("To", toHdr))
 	req.AppendHeader(sip.NewHeader("Call-ID", subData["call_id"]))
