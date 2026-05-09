@@ -320,37 +320,23 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 	// Build dialog-info XML body
 	xml := b.buildDialogInfoXML(target, presence)
 
-	// Use the phone's PRIVATE IP from Contact header
-	// The user reports this worked yesterday — sipgo may index TLS
-	// connections by the Contact URI address, not the NAT source
-	// Contact: <sip:1000.soniq-master@192.168.0.170:50030;transport=TLS>
-	parsedContact := contactURI
-	parsedContact = strings.TrimPrefix(parsedContact, "<")
-	parsedContact = strings.TrimSuffix(parsedContact, ">")
-	if idx := strings.Index(parsedContact, ";"); idx > 0 {
-		parsedContact = parsedContact[:idx]
-	}
-	parsedContact = strings.TrimPrefix(parsedContact, "sip:")
-	parsedContact = strings.TrimPrefix(parsedContact, "sips:")
-	contactParts := strings.SplitN(parsedContact, "@", 2)
-	destHost := b.conf.Realm
-	destPort := 5060
-	if len(contactParts) == 2 {
-		hp := strings.SplitN(contactParts[1], ":", 2)
-		destHost = hp[0]
-		if len(hp) == 2 {
-			destPort, _ = strconv.Atoi(hp[1])
-		}
-	}
-
-	// Build NOTIFY targeting the phone's private/Contact address
+	// Build NOTIFY targeting the subscriber
+	// Use SetDestination to route through the existing TLS connection
+	// The transport layer indexes connections by the remote address
 	reqURI := sip.Uri{
 		User: subscriber,
-		Host: destHost,
-		Port: destPort,
+		Host: b.conf.Realm,
 	}
 
 	req := sip.NewRequest(sip.NOTIFY, reqURI)
+
+	// SetDestination tells sipgo transport exactly where to send this
+	// Try NAT source address first (where the phone connected from)
+	sourceAddr := subData["source_addr"]
+	if sourceAddr != "" {
+		req.SetDestination(sourceAddr)
+	}
+
 	req.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:%s@%s>;tag=blf-%s", target, b.conf.Realm, target)))
 	req.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", subscriber, b.conf.Realm)))
 	req.AppendHeader(sip.NewHeader("Call-ID", subData["call_id"]))
@@ -367,8 +353,7 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		"subscriber", subscriber,
 		"target", target,
 		"state", presence.State,
-		"destAddr", fmt.Sprintf("%s:%d", destHost, destPort),
-		"contactURI", contactURI,
+		"destination", sourceAddr,
 	)
 
 	if err := b.sipCli.WriteRequest(req); err != nil {
