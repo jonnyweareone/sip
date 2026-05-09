@@ -153,6 +153,8 @@ type SONIQConfig struct {
 	RegExpiry int `yaml:"reg_expiry"`
 	// SIP realm (used in Contact URIs)
 	Realm string `yaml:"realm"` // default "sip.soniqlabs.co.uk"
+	// External IP for action URL responses (NAT public IP of this node)
+	ExternalIP string `yaml:"external_ip"`
 }
 
 const (

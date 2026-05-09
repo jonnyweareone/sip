@@ -89,6 +89,7 @@ func WithRedisClient(rc goredis.UniversalClient) ServiceOption {
 		if s.conf.SONIQ != nil && rc != nil {
 			s.registrar = NewRegistrar(s.conf, s.log, rc)
 			s.actionServer = NewActionServer(s.conf.SONIQ, s.log, rc)
+			s.blfManager = NewBLFManager(s.conf.SONIQ, s.log, rc, s.registrar)
 		}
 	}
 }
@@ -126,6 +127,13 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 	}
 	if s.actionServer != nil {
 		s.actionServer.SetSIPClient(s.cli)
+	}
+	// Wire BLF manager into server and register HTTP routes on action server
+	if s.blfManager != nil {
+		s.srv.blfManager = s.blfManager
+		if s.actionServer != nil {
+			s.blfManager.RegisterBLFRoutes(s.actionServer.mux)
+		}
 	}
 	var err error
 	s.sconf, err = GetServiceConfig(s.conf)

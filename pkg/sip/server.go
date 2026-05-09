@@ -167,8 +167,9 @@ type Server struct {
 
 	res mediaRes
 
-	// SONIQ: deskphone registrar
-	registrar *Registrar
+	// SONIQ: deskphone registrar + BLF
+	registrar  *Registrar
+	blfManager *BLFManager
 }
 
 type inProgressInvite struct {
@@ -195,6 +196,12 @@ func WithClient(cli *Client) ServerOption {
 func WithRegistrar(reg *Registrar) ServerOption {
 	return func(s *Server) {
 		s.registrar = reg
+	}
+}
+
+func WithBLFManager(blf *BLFManager) ServerOption {
+	return func(s *Server) {
+		s.blfManager = blf
 	}
 }
 
@@ -337,6 +344,15 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 			s.registrar.OnRegister(req, tx)
 		})
 		s.log.Infow("SONIQ registrar wired to SIP server")
+	}
+
+	// SONIQ: wire BLF SUBSCRIBE handler
+	if s.blfManager != nil {
+		s.blfManager.SetSIPServer(s.sipSrv)
+		s.sipSrv.OnSubscribe(func(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+			s.blfManager.OnSubscribe(log, req, tx)
+		})
+		s.log.Infow("SONIQ BLF manager wired to SIP server")
 	}
 
 	listenIP := s.conf.ListenIP
