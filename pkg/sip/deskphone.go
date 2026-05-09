@@ -222,9 +222,9 @@ func (s *Server) handleInternalCall(
 		EnabledFeatures: []livekit.SIPFeature{},
 		RingingTimeout:  30 * time.Second,
 		MaxCallDuration: 4 * time.Hour,
-		// Phone offers RTP/SAVP when using TLS transport — must match with SRTP
+		// Allow SRTP if phone offers it (RTP/SAVP+crypto), plain RTP otherwise
 		MediaConfig: &livekit.SIPMediaConfig{
-			Encryption: livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_REQUIRE.Enum(),
+			Encryption: livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_ALLOW.Enum(),
 		},
 	}
 }
@@ -291,9 +291,9 @@ func (s *Server) handleExternalCall(
 		EnabledFeatures: []livekit.SIPFeature{},
 		RingingTimeout:  60 * time.Second,
 		MaxCallDuration: 4 * time.Hour,
-		// Phone offers RTP/SAVP when using TLS transport — must match with SRTP
+		// Allow SRTP if phone offers it (RTP/SAVP+crypto), plain RTP otherwise
 		MediaConfig: &livekit.SIPMediaConfig{
-			Encryption: livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_REQUIRE.Enum(),
+			Encryption: livekit.SIPMediaEncryption_SIP_MEDIA_ENCRYPT_ALLOW.Enum(),
 		},
 	}
 }
