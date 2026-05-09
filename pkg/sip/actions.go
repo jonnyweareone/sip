@@ -316,6 +316,7 @@ func (a *ActionServer) handleInviteToRoom(w http.ResponseWriter, r *http.Request
 		RoomName:            req.RoomName,
 		ParticipantIdentity: req.ParticipantIdentity,
 		ParticipantName:     req.ParticipantName,
+		WaitUntilAnswered:   true,
 	})
 
 	if err != nil {
