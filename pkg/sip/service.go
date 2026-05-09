@@ -76,6 +76,7 @@ type Service struct {
 	// SONIQ
 	registrar    *Registrar
 	actionServer *ActionServer
+	blfManager   *BLFManager
 }
 
 type GetIOInfoClient func(projectID string) rpc.IOInfoClient
@@ -133,6 +134,7 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 		s.srv.blfManager = s.blfManager
 		if s.actionServer != nil {
 			s.blfManager.RegisterBLFRoutes(s.actionServer.mux)
+			s.blfManager.RegisterMWIRoutes(s.actionServer.mux)
 		}
 	}
 	var err error

@@ -59,7 +59,6 @@ type BLFManager struct {
 	conf      *config.SONIQConfig
 	redis     goredis.UniversalClient
 	registrar *Registrar
-	sipSrv    *sip.Server
 	version   atomic.Int64
 }
 
@@ -70,11 +69,6 @@ func NewBLFManager(conf *config.SONIQConfig, log logger.Logger, rc goredis.Unive
 		redis:     rc,
 		registrar: reg,
 	}
-}
-
-// SetSIPServer stores a reference to the sipgo server for sending NOTIFYs.
-func (b *BLFManager) SetSIPServer(srv *sip.Server) {
-	b.sipSrv = srv
 }
 
 // OnSubscribe handles SIP SUBSCRIBE requests (Event: dialog).
@@ -97,13 +91,21 @@ func (b *BLFManager) OnSubscribe(log *slog.Logger, req *sip.Request, tx sip.Serv
 		callID = h.Value()
 	}
 
-	// Parse Event header — we only handle "dialog" (BLF)
+	// Parse Event header — we handle "dialog" (BLF) and "message-summary" (MWI)
 	eventHdr := req.GetHeader("Event")
 	eventType := "dialog"
 	if eventHdr != nil {
 		eventType = strings.TrimSpace(strings.SplitN(eventHdr.Value(), ";", 2)[0])
 	}
-	if eventType != "dialog" && eventType != "presence" {
+
+	switch eventType {
+	case "dialog", "presence":
+		// BLF — handled below
+	case "message-summary":
+		// MWI — voicemail waiting indicator
+		b.handleMWISubscribe(ctx, subscriber, target, callID, req, tx)
+		return
+	default:
 		b.log.Infow("SUBSCRIBE for unsupported event", "event", eventType, "from", subscriber)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 489, "Bad Event", nil))
 		return
@@ -639,4 +641,187 @@ func (b *BLFManager) publishAblyEvent(ctx context.Context, channel, name, data s
 		return
 	}
 	resp.Body.Close()
+}
+
+// ── MWI (Message Waiting Indicator) ──────────────────────────────────────
+
+const redisMWISubPrefix = "sip:mwi:sub:" // per-subscription
+const redisMWISubsFor   = "sip:mwi:subs-for:" // reverse index
+
+// handleMWISubscribe accepts message-summary SUBSCRIBEs and sends voicemail count.
+func (b *BLFManager) handleMWISubscribe(ctx context.Context, subscriber, target, callID string, req *sip.Request, tx sip.ServerTransaction) {
+	// Parse Expires
+	expires := 3600
+	if exHdr := req.GetHeader("Expires"); exHdr != nil {
+		if v, err := strconv.Atoi(strings.TrimSpace(exHdr.Value())); err == nil {
+			if v == 0 {
+				// Unsubscribe MWI
+				b.redis.Del(ctx, redisMWISubPrefix+subscriber)
+				b.redis.SRem(ctx, redisMWISubsFor+target, subscriber)
+				res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+				res.AppendHeader(sip.NewHeader("Expires", "0"))
+				_ = tx.Respond(res)
+				return
+			}
+			expires = v
+		}
+	}
+
+	// Resolve target identity
+	targetIdentity := target
+	if !strings.Contains(target, ".") {
+		parts := strings.SplitN(subscriber, ".", 2)
+		if len(parts) == 2 {
+			targetIdentity = target + "." + parts[1]
+		}
+	}
+
+	b.log.Infow("MWI SUBSCRIBE",
+		"subscriber", subscriber,
+		"target", targetIdentity,
+		"expires", expires,
+	)
+
+	// Store subscription
+	ttl := time.Duration(float64(expires)*1.5) * time.Second
+	pipe := b.redis.Pipeline()
+	pipe.HSet(ctx, redisMWISubPrefix+subscriber, map[string]interface{}{
+		"subscriber": subscriber,
+		"target":     targetIdentity,
+		"call_id":    callID,
+	})
+	pipe.Expire(ctx, redisMWISubPrefix+subscriber, ttl)
+	pipe.SAdd(ctx, redisMWISubsFor+targetIdentity, subscriber)
+	pipe.Expire(ctx, redisMWISubsFor+targetIdentity, ttl)
+	pipe.Exec(ctx)
+
+	// 200 OK
+	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+	res.AppendHeader(sip.NewHeader("Expires", strconv.Itoa(expires)))
+	_ = tx.Respond(res)
+
+	// Send initial NOTIFY with current voicemail count
+	go b.sendMWINotify(ctx, subscriber, targetIdentity)
+}
+
+// sendMWINotify sends voicemail count to subscriber.
+func (b *BLFManager) sendMWINotify(ctx context.Context, subscriber, target string) {
+	// Query voicemail count from Supabase
+	newCount, oldCount := b.getVoicemailCount(ctx, target)
+
+	waiting := "no"
+	if newCount > 0 {
+		waiting = "yes"
+	}
+
+	// RFC 3842 message-summary body
+	body := fmt.Sprintf("Messages-Waiting: %s\r\nMessage-Account: sip:%s@%s\r\nVoice-Message: %d/%d\r\n",
+		waiting, target, b.conf.Realm, newCount, oldCount)
+
+	b.log.Infow("Sending MWI NOTIFY",
+		"subscriber", subscriber,
+		"target", target,
+		"new", newCount,
+		"old", oldCount,
+	)
+
+	// Store in Redis for the subscriber's next re-SUBSCRIBE to pick up
+	pendingKey := "sip:mwi:pending:" + subscriber
+	b.redis.Set(ctx, pendingKey, body, 5*time.Minute)
+}
+
+// getVoicemailCount queries Supabase for voicemail counts.
+func (b *BLFManager) getVoicemailCount(ctx context.Context, identity string) (newCount, oldCount int) {
+	// Extract extension from identity (e.g. "1003.soniq-master" → "1003")
+	ext := strings.SplitN(identity, ".", 2)[0]
+
+	// Query voicemails table for this user's extension
+	// Count new (unread) and old (read) voicemails
+	url := fmt.Sprintf("%s/rest/v1/voicemails?select=id,is_read&extension=eq.%s",
+		b.conf.SupabaseURL, ext)
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return 0, 0
+	}
+	httpReq.Header.Set("apikey", b.conf.SupabaseAnonKey)
+	httpReq.Header.Set("Authorization", "Bearer "+b.conf.SupabaseAnonKey)
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		b.log.Debugw("Voicemail query failed", "err", err.Error())
+		return 0, 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		// Table might not exist yet — return 0/0
+		return 0, 0
+	}
+
+	var vms []struct {
+		ID     string `json:"id"`
+		IsRead bool   `json:"is_read"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&vms); err != nil {
+		return 0, 0
+	}
+
+	for _, vm := range vms {
+		if vm.IsRead {
+			oldCount++
+		} else {
+			newCount++
+		}
+	}
+	return newCount, oldCount
+}
+
+// UpdateMWI pushes voicemail count update to all subscribed phones for a user.
+// Called by soniq-router when a new voicemail is recorded or marked as read.
+func (b *BLFManager) UpdateMWI(ctx context.Context, identity string) {
+	subsForKey := redisMWISubsFor + identity
+	subscribers, err := b.redis.SMembers(ctx, subsForKey).Result()
+	if err != nil || len(subscribers) == 0 {
+		// The user's own phone subscribes to their own MWI
+		// So also check if the identity itself has a subscription
+		b.sendMWINotify(ctx, identity, identity)
+		return
+	}
+	for _, sub := range subscribers {
+		b.sendMWINotify(ctx, sub, identity)
+	}
+}
+
+// RegisterMWIRoutes adds MWI HTTP endpoints to the action server mux.
+func (b *BLFManager) RegisterMWIRoutes(mux *http.ServeMux) {
+	// POST /api/mwi/update — trigger MWI update (from soniq-router after voicemail)
+	mux.HandleFunc("/api/mwi/update", b.handleMWIUpdate)
+}
+
+// handleMWIUpdate receives MWI update requests from soniq-router.
+// POST /api/mwi/update
+// Body: {"identity": "1000.soniq-master"}
+func (b *BLFManager) handleMWIUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	secret := r.Header.Get("X-Internal-Secret")
+	if secret != "sNq-nTfY-2026-xK9p" {
+		http.Error(w, "forbidden", 403)
+		return
+	}
+
+	var req struct {
+		Identity string `json:"identity"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Identity == "" {
+		http.Error(w, "identity required", 400)
+		return
+	}
+
+	b.UpdateMWI(r.Context(), req.Identity)
+	w.WriteHeader(200)
+	_, _ = w.Write([]byte(`{"ok":true}`))
 }

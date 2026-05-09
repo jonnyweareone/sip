@@ -348,7 +348,6 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 
 	// SONIQ: wire BLF SUBSCRIBE handler
 	if s.blfManager != nil {
-		s.blfManager.SetSIPServer(s.sipSrv)
 		s.sipSrv.OnSubscribe(func(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
 			s.blfManager.OnSubscribe(log, req, tx)
 		})
