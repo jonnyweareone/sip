@@ -343,13 +343,10 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		}
 	}
 
-	// But the phone is behind NAT — use the NAT IP from registration instead
-	natIP := subFields["nat_ip"]
-	natPort, _ := strconv.Atoi(subFields["nat_port"])
-	if natIP != "" && natPort > 0 {
-		contactHost = natIP
-		contactPort = natPort
-	}
+	// Use the phone's PRIVATE IP from Contact header (not NAT IP)
+	// sipgo indexes TLS connections by the Contact address, so sending to the
+	// private IP will match the existing registration TLS connection.
+	// NAT IP would cause sipgo to open a new connection that can't reach the phone.
 
 	// Build NOTIFY request targeting the phone's actual address
 	reqURI := sip.Uri{
