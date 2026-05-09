@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/rpc"
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/livekit/sip/pkg/config"
@@ -34,11 +35,12 @@ type ActionEvent struct {
 
 // ActionServer handles HTTP requests from Yealink action URLs.
 type ActionServer struct {
-	log   logger.Logger
-	conf  *config.SONIQConfig
-	redis goredis.UniversalClient
-	mux   *http.ServeMux
-	srv   *http.Server
+	log    logger.Logger
+	conf   *config.SONIQConfig
+	redis  goredis.UniversalClient
+	mux    *http.ServeMux
+	srv    *http.Server
+	sipCli *Client // reference to SIP client for CreateSIPParticipant
 }
 
 func NewActionServer(conf *config.SONIQConfig, log logger.Logger, rc goredis.UniversalClient) *ActionServer {
@@ -52,12 +54,24 @@ func NewActionServer(conf *config.SONIQConfig, log logger.Logger, rc goredis.Uni
 	return a
 }
 
+// SetSIPClient sets the SIP client reference after construction (avoids circular deps)
+func (a *ActionServer) SetSIPClient(cli *Client) {
+	a.sipCli = cli
+}
+
 func (a *ActionServer) registerRoutes() {
 	// POST /actions/{identity}/{action}
 	// POST /actions/{identity}/execute-chip/{chip_id}
 	// POST /actions/{identity}/dial/{target}
 	// POST /actions/{identity}/xml-response/{prompt_id}/{key}
 	a.mux.HandleFunc("/actions/", a.handleAction)
+
+	// POST /api/invite-to-room — soniq-router calls this to ring a registered SIP device
+	// Body: { "extension": "1000", "org_slug": "soniq-master", "room_name": "...",
+	//         "caller_number": "+447...", "caller_name": "Jonny", "participant_identity": "sip-1000" }
+	// This invites the phone directly via the existing TLS connection — no trunk needed.
+	a.mux.HandleFunc("/api/invite-to-room", a.handleInviteToRoom)
+
 	// Health check
 	a.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -215,4 +229,96 @@ func (a *ActionServer) publishToAbly(ctx context.Context, event ActionEvent) err
 		return fmt.Errorf("ably returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// ── Invite-to-Room API ───────────────────────────────────────────────────
+// POST /api/invite-to-room
+// Called by soniq-router to ring a registered SIP deskphone into a LiveKit room.
+// This replaces the old CreateSIPParticipant → trunk → Drachtio roundabout.
+// The phone is invited directly via its existing TLS registration connection.
+
+type inviteToRoomReq struct {
+	Extension           string `json:"extension"`             // e.g. "1000"
+	OrgSlug             string `json:"org_slug"`              // e.g. "soniq-master"
+	RoomName            string `json:"room_name"`             // LiveKit room to join
+	CallerNumber        string `json:"caller_number"`         // CLI for display
+	CallerName          string `json:"caller_name"`           // Display name
+	ParticipantIdentity string `json:"participant_identity"`  // e.g. "sip-1000"
+	ParticipantName     string `json:"participant_name"`      // e.g. "Jonny Robinson"
+}
+
+func (a *ActionServer) handleInviteToRoom(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	// Auth: check shared secret
+	secret := r.Header.Get("X-Internal-Secret")
+	if secret != "sNq-nTfY-2026-xK9p" {
+		http.Error(w, "forbidden", 403)
+		return
+	}
+
+	var req inviteToRoomReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), 400)
+		return
+	}
+
+	if req.Extension == "" || req.RoomName == "" {
+		http.Error(w, "extension and room_name required", 400)
+		return
+	}
+
+	if req.OrgSlug == "" {
+		req.OrgSlug = "soniq-master"
+	}
+	if req.ParticipantIdentity == "" {
+		req.ParticipantIdentity = "sip-" + req.Extension
+	}
+
+	identity := req.Extension + "." + req.OrgSlug
+
+	a.log.Infow("invite-to-room",
+		"extension", req.Extension,
+		"room", req.RoomName,
+		"caller", req.CallerNumber,
+		"identity", identity,
+	)
+
+	// Use CreateSIPParticipant which goes through our ResolveEndpoint intercept
+	// That bypasses the trunk and dials the registered phone directly from Redis
+	if a.sipCli == nil {
+		http.Error(w, "SIP client not available", 503)
+		return
+	}
+
+	ctx := r.Context()
+	resp, err := a.sipCli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
+		CallTo:              identity,
+		RoomName:            req.RoomName,
+		ParticipantIdentity: req.ParticipantIdentity,
+		ParticipantName:     req.ParticipantName,
+		// Address will be filled by ResolveEndpoint from Redis
+		// Number will be filled by ResolveEndpoint
+		Headers: map[string]string{
+			"X-SONIQ-Internal": "1",
+			"X-Caller-ID":     req.CallerNumber,
+			"X-Caller-Name":   req.CallerName,
+		},
+	})
+
+	if err != nil {
+		a.log.Errorw("invite-to-room failed", err, "identity", identity)
+		http.Error(w, "invite failed: "+err.Error(), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":             true,
+		"participant_id": resp.GetParticipantId(),
+		"identity":       resp.GetParticipantIdentity(),
+	})
 }

@@ -124,6 +124,9 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 		s.srv.registrar = s.registrar
 		s.cli.registrar = s.registrar
 	}
+	if s.actionServer != nil {
+		s.actionServer.SetSIPClient(s.cli)
+	}
 	var err error
 	s.sconf, err = GetServiceConfig(s.conf)
 	if err != nil {
