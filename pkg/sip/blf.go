@@ -167,11 +167,16 @@ func (b *BLFManager) OnSubscribe(log *slog.Logger, req *sip.Request, tx sip.Serv
 	)
 
 	// Store subscription in Redis
-	b.storeSubscription(ctx, subscriber, targetIdentity, callID, expires, req)
+	serverTag := fmt.Sprintf("soniq-blf-%d", time.Now().UnixMilli())
+	b.storeSubscription(ctx, subscriber, targetIdentity, callID, expires, req, serverTag)
 
-	// 200 OK
+	// 200 OK — add server tag to To header
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Expires", strconv.Itoa(expires)))
+	// Ensure To header has our server tag for dialog matching
+	if toHdr := res.To(); toHdr != nil {
+		toHdr.Params.Add("tag", serverTag)
+	}
 	_ = tx.Respond(res)
 
 	// Send initial NOTIFY with current state
@@ -179,7 +184,7 @@ func (b *BLFManager) OnSubscribe(log *slog.Logger, req *sip.Request, tx sip.Serv
 }
 
 // storeSubscription saves BLF subscription to Redis with dialog headers for NOTIFY.
-func (b *BLFManager) storeSubscription(ctx context.Context, subscriber, target, callID string, expires int, req *sip.Request) {
+func (b *BLFManager) storeSubscription(ctx context.Context, subscriber, target, callID string, expires int, req *sip.Request, serverTag string) {
 	subKey := redisBLFSubPrefix + subscriber + ":" + target
 	ttl := time.Duration(float64(expires)*1.5) * time.Second
 
@@ -204,6 +209,7 @@ func (b *BLFManager) storeSubscription(ctx context.Context, subscriber, target, 
 		"call_id":     callID,
 		"from_hdr":    fromHdr,
 		"to_hdr":      toHdr,
+		"server_tag":  serverTag,
 		"source_addr": sourceAddr,
 		"expires":     strconv.Itoa(expires),
 		"created_at":  strconv.FormatInt(time.Now().Unix(), 10),
@@ -334,17 +340,22 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		Host: b.conf.Realm,
 	}
 
-	req := sip.NewRequest(sip.NOTIFY, reqURI)
+	// Build NOTIFY with correct dialog headers
+	// In a SUBSCRIBE dialog, the NOTIFY swaps From/To:
+	//   SUBSCRIBE From (phone) → NOTIFY To (phone, with phone's tag)
+	//   SUBSCRIBE To (server) → NOTIFY From (server, with server's tag)
+	serverTag := subData["server_tag"]
+	fromHdr := subData["to_hdr"] // Server identity (was To in SUBSCRIBE)
+	toHdr := subData["from_hdr"] // Phone identity with tag (was From in SUBSCRIBE)
 
-	// SetDestination tells sipgo transport exactly where to send this
-	// Try NAT source address first (where the phone connected from)
-	sourceAddr := subData["source_addr"]
-	if sourceAddr != "" {
-		req.SetDestination(sourceAddr)
+	// Add server tag to From if not already present
+	if serverTag != "" && !strings.Contains(fromHdr, "tag=") {
+		fromHdr = fromHdr + ";tag=" + serverTag
 	}
 
-	req.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:%s@%s>;tag=blf-%s", target, b.conf.Realm, target)))
-	req.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", subscriber, b.conf.Realm)))
+	req := sip.NewRequest(sip.NOTIFY, reqURI)
+	req.AppendHeader(sip.NewHeader("From", fromHdr))
+	req.AppendHeader(sip.NewHeader("To", toHdr))
 	req.AppendHeader(sip.NewHeader("Call-ID", subData["call_id"]))
 	req.AppendHeader(sip.NewHeader("CSeq", "1 NOTIFY"))
 	req.AppendHeader(sip.NewHeader("Event", "dialog"))
