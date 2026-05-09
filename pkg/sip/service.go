@@ -131,6 +131,7 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 	if s.actionServer != nil {
 		s.actionServer.SetSIPClient(s.cli)
 		s.actionServer.registrar = s.registrar
+		s.actionServer.epWriter = s.epWriter
 	}
 	// Wire BLF manager into server and register HTTP routes on action server
 	if s.blfManager != nil {

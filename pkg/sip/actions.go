@@ -16,6 +16,7 @@ import (
 
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
+	"github.com/livekit/sipgo/sip"
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/livekit/sip/pkg/config"
@@ -42,6 +43,7 @@ type ActionServer struct {
 	srv       *http.Server
 	sipCli    *Client // reference to SIP client for CreateSIPParticipant
 	registrar *Registrar // for endpoint resolution
+	epWriter  *EndpointWriter // persistent TLS connection writer
 }
 
 func NewActionServer(conf *config.SONIQConfig, log logger.Logger, rc goredis.UniversalClient) *ActionServer {
@@ -72,6 +74,9 @@ func (a *ActionServer) registerRoutes() {
 	//         "caller_number": "+447...", "caller_name": "Jonny", "participant_identity": "sip-1000" }
 	// This invites the phone directly via the existing TLS connection — no trunk needed.
 	a.mux.HandleFunc("/api/invite-to-room", a.handleInviteToRoom)
+
+	// POST /api/page — send XML screen pop to a registered phone via persistent TLS
+	a.mux.HandleFunc("/api/page", a.handlePage)
 
 	// Health check
 	a.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -345,4 +350,127 @@ func (a *ActionServer) resolveEndpointForInvite(ctx context.Context, identity st
 		return "", nil, fmt.Errorf("endpoint not found: %s", identity)
 	}
 	return result["contact_uri"], result, nil
+}
+
+// handlePage sends Yealink XML via SIP NOTIFY through the persistent TLS connection.
+// POST /api/page
+// Body: { "extension": "1000", "org_slug": "soniq-master", "type": "text|execute|config",
+//         "title": "...", "text": "...", "beep": true, "timeout": 10,
+//         "items": ["Led:LINE2_GREEN=on"] }
+func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	var req struct {
+		Extension string   `json:"extension"`
+		OrgSlug   string   `json:"org_slug"`
+		Type      string   `json:"type"`     // "text", "execute", "config"
+		Title     string   `json:"title"`
+		Text      string   `json:"text"`
+		Beep      bool     `json:"beep"`
+		Timeout   int      `json:"timeout"`
+		Items     []string `json:"items"`    // for execute/config
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), 400)
+		return
+	}
+	if req.Extension == "" {
+		http.Error(w, "extension required", 400)
+		return
+	}
+	if req.OrgSlug == "" {
+		req.OrgSlug = "soniq-master"
+	}
+	if req.Type == "" {
+		req.Type = "text"
+	}
+	if req.Timeout == 0 {
+		req.Timeout = 10
+	}
+
+	identity := req.Extension + "." + req.OrgSlug
+
+	// Build Yealink XML body based on type
+	var xmlBody string
+	beepStr := "no"
+	if req.Beep {
+		beepStr = "yes"
+	}
+
+	switch req.Type {
+	case "text":
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneTextScreen Beep="%s" Timeout="%d">
+<Title>%s</Title>
+<Text>%s</Text>
+</YealinkIPPhoneTextScreen>`, beepStr, req.Timeout, req.Title, req.Text)
+
+	case "execute":
+		items := ""
+		for _, item := range req.Items {
+			items += fmt.Sprintf(`<ExecuteItem URI="%s"/>`, item)
+		}
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneExecute Beep="%s">
+%s
+</YealinkIPPhoneExecute>`, beepStr, items)
+
+	case "config":
+		items := ""
+		for _, item := range req.Items {
+			items += fmt.Sprintf(`<Item>%s</Item>`, item)
+		}
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneConfiguration>
+%s
+</YealinkIPPhoneConfiguration>`, items)
+
+	default:
+		http.Error(w, "type must be text, execute, or config", 400)
+		return
+	}
+
+	if a.epWriter == nil {
+		http.Error(w, "endpoint writer not available", 503)
+		return
+	}
+
+	// Build SIP NOTIFY with XML body
+	reqURI := sip.Uri{User: identity, Host: a.conf.Realm}
+	notify := sip.NewRequest(sip.NOTIFY, reqURI)
+
+	// Via header required
+	via := &sip.ViaHeader{
+		ProtocolName:    "SIP",
+		ProtocolVersion: "2.0",
+		Transport:       "TLS",
+		Host:            a.conf.ExternalIP,
+		Port:            a.conf.RegPortListen,
+		Params:          sip.NewParams(),
+	}
+	via.Params.Add("branch", sip.GenerateBranch())
+	notify.AppendHeader(via)
+	notify.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:soniq@%s>;tag=page-%d", a.conf.Realm, time.Now().UnixMilli())))
+	notify.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", identity, a.conf.Realm)))
+	notify.AppendHeader(sip.NewHeader("Call-ID", fmt.Sprintf("page-%d@%s", time.Now().UnixNano(), a.conf.ExternalIP)))
+	notify.AppendHeader(sip.NewHeader("CSeq", "1 NOTIFY"))
+	notify.AppendHeader(sip.NewHeader("Event", "xml-push"))
+	notify.AppendHeader(sip.NewHeader("Subscription-State", "active"))
+	notify.AppendHeader(sip.NewHeader("Content-Type", "application/xml"))
+	notify.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+	notify.SetBody([]byte(xmlBody))
+
+	ctx := r.Context()
+	if err := a.epWriter.WriteMsg(ctx, identity, notify); err != nil {
+		a.log.Errorw("page failed", err, "identity", identity, "type", req.Type)
+		http.Error(w, "page failed: "+err.Error(), 500)
+		return
+	}
+
+	a.log.Infow("page sent", "identity", identity, "type", req.Type, "title", req.Title)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "identity": identity, "type": req.Type})
 }
