@@ -320,24 +320,30 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 	// Build dialog-info XML body
 	xml := b.buildDialogInfoXML(target, presence)
 
-	// Use the source address from the SUBSCRIBE request
-	// This is the NAT endpoint the phone connected from — the transport
-	// layer has the TLS connection indexed by this address
-	sourceAddr := subData["source_addr"]
-	if sourceAddr == "" {
-		b.log.Warnw("No source_addr stored for subscription", nil, "subscriber", subscriber)
-		return
+	// Use the phone's PRIVATE IP from Contact header
+	// The user reports this worked yesterday — sipgo may index TLS
+	// connections by the Contact URI address, not the NAT source
+	// Contact: <sip:1000.soniq-master@192.168.0.170:50030;transport=TLS>
+	parsedContact := contactURI
+	parsedContact = strings.TrimPrefix(parsedContact, "<")
+	parsedContact = strings.TrimSuffix(parsedContact, ">")
+	if idx := strings.Index(parsedContact, ";"); idx > 0 {
+		parsedContact = parsedContact[:idx]
 	}
-
-	// Parse source address (e.g. "81.108.56.41:50034")
-	addrParts := strings.SplitN(sourceAddr, ":", 2)
-	destHost := addrParts[0]
+	parsedContact = strings.TrimPrefix(parsedContact, "sip:")
+	parsedContact = strings.TrimPrefix(parsedContact, "sips:")
+	contactParts := strings.SplitN(parsedContact, "@", 2)
+	destHost := b.conf.Realm
 	destPort := 5060
-	if len(addrParts) == 2 {
-		destPort, _ = strconv.Atoi(addrParts[1])
+	if len(contactParts) == 2 {
+		hp := strings.SplitN(contactParts[1], ":", 2)
+		destHost = hp[0]
+		if len(hp) == 2 {
+			destPort, _ = strconv.Atoi(hp[1])
+		}
 	}
 
-	// Build NOTIFY request targeting the phone's NAT source address
+	// Build NOTIFY targeting the phone's private/Contact address
 	reqURI := sip.Uri{
 		User: subscriber,
 		Host: destHost,
@@ -361,7 +367,8 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		"subscriber", subscriber,
 		"target", target,
 		"state", presence.State,
-		"destAddr", sourceAddr,
+		"destAddr", fmt.Sprintf("%s:%d", destHost, destPort),
+		"contactURI", contactURI,
 	)
 
 	if err := b.sipCli.WriteRequest(req); err != nil {
