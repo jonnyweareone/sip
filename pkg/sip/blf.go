@@ -59,7 +59,8 @@ type BLFManager struct {
 	conf      *config.SONIQConfig
 	redis     goredis.UniversalClient
 	registrar *Registrar
-	sipCli    SIPClient // sipgo client for sending NOTIFYs
+	sipCli    SIPClient // sipgo client for sending NOTIFYs (fallback)
+	epWriter  *EndpointWriter // persistent TLS connection writer
 	version   atomic.Int64
 }
 
@@ -75,6 +76,11 @@ func NewBLFManager(conf *config.SONIQConfig, log logger.Logger, rc goredis.Unive
 // SetSIPClient provides the sipgo client for sending outbound NOTIFYs.
 func (b *BLFManager) SetSIPClient(cli SIPClient) {
 	b.sipCli = cli
+}
+
+// SetEndpointWriter provides the persistent TLS connection writer.
+func (b *BLFManager) SetEndpointWriter(ew *EndpointWriter) {
+	b.epWriter = ew
 }
 
 // OnSubscribe handles SIP SUBSCRIBE requests (Event: dialog).
@@ -349,15 +355,23 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		target, b.conf.ExternalIP, b.conf.RegPortListen)))
 	req.SetBody([]byte(xml))
 
-	b.log.Infow("Sending BLF NOTIFY via SIP",
+	b.log.Infow("Sending BLF NOTIFY via persistent TLS",
 		"subscriber", subscriber,
 		"target", target,
 		"state", presence.State,
-		"destination", sourceAddr,
 	)
 
+	// Use EndpointWriter to write directly to the phone's TLS connection
+	if b.epWriter != nil {
+		if err := b.epWriter.WriteMsg(ctx, subscriber, req); err != nil {
+			b.log.Warnw("Failed to send BLF NOTIFY via endpoint writer", err, "subscriber", subscriber, "target", target)
+		}
+		return
+	}
+
+	// Fallback to sipCli.WriteRequest (legacy path)
 	if err := b.sipCli.WriteRequest(req); err != nil {
-		b.log.Warnw("Failed to send BLF NOTIFY", err, "subscriber", subscriber, "target", target)
+		b.log.Warnw("Failed to send BLF NOTIFY via sipCli", err, "subscriber", subscriber, "target", target)
 	}
 }
 

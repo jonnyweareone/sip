@@ -77,6 +77,7 @@ type Service struct {
 	registrar    *Registrar
 	actionServer *ActionServer
 	blfManager   *BLFManager
+	epWriter     *EndpointWriter
 }
 
 type GetIOInfoClient func(projectID string) rpc.IOInfoClient
@@ -91,6 +92,7 @@ func WithRedisClient(rc goredis.UniversalClient) ServiceOption {
 			s.registrar = NewRegistrar(s.conf, s.log, rc)
 			s.actionServer = NewActionServer(s.conf.SONIQ, s.log, rc)
 			s.blfManager = NewBLFManager(s.conf.SONIQ, s.log, rc, s.registrar)
+			s.epWriter = NewEndpointWriter(s.log, rc)
 		}
 	}
 }
@@ -133,6 +135,9 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 	// Wire BLF manager into server and register HTTP routes on action server
 	if s.blfManager != nil {
 		s.srv.blfManager = s.blfManager
+		if s.epWriter != nil {
+			s.blfManager.SetEndpointWriter(s.epWriter)
+		}
 		if s.actionServer != nil {
 			s.blfManager.RegisterBLFRoutes(s.actionServer.mux)
 			s.blfManager.RegisterMWIRoutes(s.actionServer.mux)
@@ -360,6 +365,13 @@ func (s *Service) Start() error {
 	// Thus, all unhandled transactions will be checked by the client.
 	if err := s.srv.Start(ua, s.sconf, tlsConf, s.cli.OnRequest); err != nil {
 		return err
+	}
+
+	// SONIQ: Wire the sipgo server to the EndpointWriter so it can access
+	// the TLS connection pool for direct writes to registered phones.
+	if s.epWriter != nil && s.srv.sipSrv != nil {
+		s.epWriter.SetServer(s.srv.sipSrv)
+		s.log.Infow("EndpointWriter wired to sipgo server transport layer")
 	}
 
 	// SONIQ: Start action URL server for Yealink button presses
