@@ -59,6 +59,7 @@ type BLFManager struct {
 	conf      *config.SONIQConfig
 	redis     goredis.UniversalClient
 	registrar *Registrar
+	sipCli    SIPClient // sipgo client for sending NOTIFYs
 	version   atomic.Int64
 }
 
@@ -69,6 +70,11 @@ func NewBLFManager(conf *config.SONIQConfig, log logger.Logger, rc goredis.Unive
 		redis:     rc,
 		registrar: reg,
 	}
+}
+
+// SetSIPClient provides the sipgo client for sending outbound NOTIFYs.
+func (b *BLFManager) SetSIPClient(cli SIPClient) {
+	b.sipCli = cli
 }
 
 // OnSubscribe handles SIP SUBSCRIBE requests (Event: dialog).
@@ -155,7 +161,7 @@ func (b *BLFManager) OnSubscribe(log *slog.Logger, req *sip.Request, tx sip.Serv
 	)
 
 	// Store subscription in Redis
-	b.storeSubscription(ctx, subscriber, targetIdentity, callID, expires)
+	b.storeSubscription(ctx, subscriber, targetIdentity, callID, expires, req)
 
 	// 200 OK
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
@@ -166,21 +172,32 @@ func (b *BLFManager) OnSubscribe(log *slog.Logger, req *sip.Request, tx sip.Serv
 	go b.sendNotify(ctx, subscriber, targetIdentity, callID)
 }
 
-// storeSubscription saves BLF subscription to Redis.
-func (b *BLFManager) storeSubscription(ctx context.Context, subscriber, target, callID string, expires int) {
+// storeSubscription saves BLF subscription to Redis with dialog headers for NOTIFY.
+func (b *BLFManager) storeSubscription(ctx context.Context, subscriber, target, callID string, expires int, req *sip.Request) {
 	subKey := redisBLFSubPrefix + subscriber + ":" + target
 	ttl := time.Duration(float64(expires)*1.5) * time.Second
+
+	// Store dialog headers needed for NOTIFY
+	fromHdr := ""
+	toHdr := ""
+	if f := req.From(); f != nil {
+		fromHdr = f.Value()
+	}
+	if t := req.To(); t != nil {
+		toHdr = t.Value()
+	}
 
 	pipe := b.redis.Pipeline()
 	pipe.HSet(ctx, subKey, map[string]interface{}{
 		"subscriber": subscriber,
 		"target":     target,
 		"call_id":    callID,
+		"from_hdr":   fromHdr,
+		"to_hdr":     toHdr,
 		"expires":    strconv.Itoa(expires),
 		"created_at": strconv.FormatInt(time.Now().Unix(), 10),
 	})
 	pipe.Expire(ctx, subKey, ttl)
-	// Also add to the reverse index: who is subscribed to this target
 	subsForKey := redisBLFSubsFor + target
 	pipe.SAdd(ctx, subsForKey, subscriber)
 	pipe.Expire(ctx, subsForKey, ttl)
@@ -273,38 +290,76 @@ func (b *BLFManager) fanOutNotify(ctx context.Context, target string) {
 
 // sendNotify sends a SIP NOTIFY with dialog-info XML to a subscriber.
 func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID string) {
+	if b.sipCli == nil {
+		b.log.Debugw("No SIP client — cannot send NOTIFY", "subscriber", subscriber)
+		return
+	}
+
 	presence, err := b.GetPresence(ctx, target)
 	if err != nil {
 		b.log.Errorw("failed to get presence for NOTIFY", err, "target", target)
 		return
 	}
 
-	// Look up subscriber's contact URI from Redis
-	_, subFields, err := b.registrar.ResolveEndpoint(ctx, subscriber)
-	if err != nil || subFields == nil {
+	// Look up subscriber's contact URI from Redis registration
+	contactURI, subFields, err := b.registrar.ResolveEndpoint(ctx, subscriber)
+	if err != nil || subFields == nil || contactURI == "" {
 		b.log.Debugw("subscriber not registered, skipping NOTIFY", "subscriber", subscriber)
 		return
 	}
 
-	// Build dialog-info XML body (RFC 4235)
+	// Get subscription dialog headers
+	subKey := redisBLFSubPrefix + subscriber + ":" + target
+	subData, _ := b.redis.HGetAll(ctx, subKey).Result()
+
+	// Build dialog-info XML body
 	xml := b.buildDialogInfoXML(target, presence)
 
-	b.log.Infow("Sending BLF NOTIFY",
+	// Parse contact URI for the request target
+	// Contact is like: <sip:1000.soniq-master@192.168.0.170:50030;transport=TLS>
+	// We need to send to the phone's address
+	toURI := sip.Uri{
+		User: target,
+		Host: b.conf.Realm,
+	}
+	fromURI := sip.Uri{
+		User: target,
+		Host: b.conf.Realm,
+	}
+
+	// Build NOTIFY request
+	// In the NOTIFY, From = the entity being monitored (target)
+	// To = the subscriber
+	subURI := sip.Uri{
+		User: subscriber,
+		Host: b.conf.Realm,
+	}
+
+	req := sip.NewRequest(sip.NOTIFY, subURI)
+	req.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:%s@%s>", target, b.conf.Realm)))
+	req.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", subscriber, b.conf.Realm)))
+	req.AppendHeader(sip.NewHeader("Call-ID", subData["call_id"]))
+	req.AppendHeader(sip.NewHeader("CSeq", "1 NOTIFY"))
+	req.AppendHeader(sip.NewHeader("Event", "dialog"))
+	req.AppendHeader(sip.NewHeader("Subscription-State", "active"))
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/dialog-info+xml"))
+	req.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<sip:%s@%s:%d;transport=tls>",
+		target, b.conf.ExternalIP, b.conf.RegPortListen)))
+	req.SetBody([]byte(xml))
+
+	_ = toURI
+	_ = fromURI
+
+	b.log.Infow("Sending BLF NOTIFY via SIP",
 		"subscriber", subscriber,
 		"target", target,
 		"state", presence.State,
-		"version", presence.Version,
+		"contactURI", contactURI,
 	)
 
-	// Build and send SIP NOTIFY via sipgo
-	// For now, use the action server's HTTP endpoint as a workaround
-	// since sending SIP NOTIFY through sipgo requires the existing dialog context.
-	// We'll store the XML in Redis and let the phone's next re-SUBSCRIBE pick it up.
-	// TODO: Implement proper SIP NOTIFY send via sipgo transaction layer.
-
-	// Store pending NOTIFY state for the subscriber's next re-SUBSCRIBE
-	pendingKey := "sip:blf:pending:" + subscriber + ":" + target
-	b.redis.Set(ctx, pendingKey, xml, 5*time.Minute)
+	if err := b.sipCli.WriteRequest(req); err != nil {
+		b.log.Warnw("Failed to send BLF NOTIFY", err, "subscriber", subscriber, "target", target)
+	}
 }
 
 // buildDialogInfoXML creates RFC 4235 dialog-info XML for Yealink BLF.

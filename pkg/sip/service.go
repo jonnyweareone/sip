@@ -349,6 +349,12 @@ func (s *Service) Start() error {
 	if err := s.cli.Start(ua, s.sconf); err != nil {
 		return err
 	}
+
+	// SONIQ: Wire BLF manager's SIP client after cli.Start() initializes sipCli
+	if s.blfManager != nil && s.cli.sipCli != nil {
+		s.blfManager.SetSIPClient(s.cli.sipCli)
+		s.log.Infow("BLF manager wired to SIP client for outbound NOTIFYs")
+	}
 	// Server is responsible for answering all transactions. However, the client may also receive some (e.g. BYE).
 	// Thus, all unhandled transactions will be checked by the client.
 	if err := s.srv.Start(ua, s.sconf, tlsConf, s.cli.OnRequest); err != nil {
