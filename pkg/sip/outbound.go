@@ -1055,7 +1055,13 @@ func (c *sipOutbound) AckInviteOK(ctx context.Context) error {
 	if c.invite == nil || c.inviteOk == nil {
 		return errors.New("call already closed")
 	}
-	return c.c.sipCli.WriteRequest(sip.NewAckRequest(c.invite, c.inviteOk, nil))
+	ack := sip.NewAckRequest(c.invite, c.inviteOk, nil)
+	// SONIQ: Reuse the INVITE's destination so the ACK goes through the
+	// same TLS connection (NAT address pool key, not the private IP).
+	if dest := c.invite.Destination(); dest != "" {
+		ack.SetDestination(dest)
+	}
+	return c.c.sipCli.WriteRequest(ack)
 }
 
 func (c *sipOutbound) attemptInvite(ctx context.Context, callID sip.CallIDHeader, to *sip.ToHeader, offer []byte, authHeaderName, authHeader string, headers Headers, setState sipRespFunc) (*sip.Request, *sip.Response, error) {
@@ -1147,6 +1153,10 @@ func (c *sipOutbound) sendBye(ctx context.Context) {
 	ctx, span := Tracer.Start(ctx, "sip.outbound.sendBye")
 	defer span.End()
 	r := sip.NewByeRequest(c.invite, c.inviteOk, nil)
+	// SONIQ: Route BYE through the same TLS connection as the INVITE
+	if dest := c.invite.Destination(); dest != "" {
+		r.SetDestination(dest)
+	}
 	r.AppendHeader(sip.NewHeader("User-Agent", "LiveKit"))
 	if c.getHeaders != nil {
 		for k, v := range c.getHeaders(nil) {
