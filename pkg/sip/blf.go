@@ -370,6 +370,11 @@ func (b *BLFManager) sendNotify(ctx context.Context, subscriber, target, callID 
 		"subscriber", subscriber,
 		"target", target,
 		"state", presence.State,
+		"from", fromHdr,
+		"to", toHdr,
+		"callID", subData["call_id"],
+		"serverTag", serverTag,
+		"body", string(req.Body()),
 	)
 
 	// Use EndpointWriter to write directly to the phone's TLS connection
