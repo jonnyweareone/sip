@@ -667,6 +667,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	c.sigTs.AcceptTime = time.Now()
 	c.mon.SDPSize(len(sdpResp), false)
 	c.log.Debugw("SDP answer", "sdp", string(sdpResp))
+	c.log.Infow("SONIQ SDP DEBUG: answer from phone", "sdpAnswer", string(sdpResp))
 
 	// SONIQ: Fix NAT'd SDP in callee's response.
 	// The callee's phone advertises its private LAN IP in SDP.
@@ -685,6 +686,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	if err != nil {
 		return err
 	}
+	c.log.Infow("SONIQ SDP DEBUG: server localSDP (what phone received in INVITE)", "localSDP", string(localSDP))
 	if err = c.media.SetConfig(mc); err != nil {
 		return err
 	}
