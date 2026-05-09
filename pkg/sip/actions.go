@@ -35,12 +35,13 @@ type ActionEvent struct {
 
 // ActionServer handles HTTP requests from Yealink action URLs.
 type ActionServer struct {
-	log    logger.Logger
-	conf   *config.SONIQConfig
-	redis  goredis.UniversalClient
-	mux    *http.ServeMux
-	srv    *http.Server
-	sipCli *Client // reference to SIP client for CreateSIPParticipant
+	log       logger.Logger
+	conf      *config.SONIQConfig
+	redis     goredis.UniversalClient
+	mux       *http.ServeMux
+	srv       *http.Server
+	sipCli    *Client // reference to SIP client for CreateSIPParticipant
+	registrar *Registrar // for endpoint resolution
 }
 
 func NewActionServer(conf *config.SONIQConfig, log logger.Logger, rc goredis.UniversalClient) *ActionServer {
@@ -280,33 +281,41 @@ func (a *ActionServer) handleInviteToRoom(w http.ResponseWriter, r *http.Request
 
 	identity := req.Extension + "." + req.OrgSlug
 
+	// Resolve endpoint from Redis — get NAT address for direct routing
+	// This mirrors deskphone.go's handleInternalCall which sets Address + Transport
+	endpointContact, endpointFields, _ := a.resolveEndpointForInvite(r.Context(), identity)
+
 	a.log.Infow("invite-to-room",
 		"extension", req.Extension,
 		"room", req.RoomName,
 		"caller", req.CallerNumber,
 		"identity", identity,
+		"contact", endpointContact,
 	)
 
-	// Use CreateSIPParticipant which goes through our ResolveEndpoint intercept
-	// That bypasses the trunk and dials the registered phone directly from Redis
 	if a.sipCli == nil {
 		http.Error(w, "SIP client not available", 503)
 		return
 	}
 
+	// Build address from endpoint fields (same as deskphone.go)
+	address := ""
+	if endpointFields != nil {
+		address = endpointFields["nat_ip"] + ":" + endpointFields["nat_port"]
+	}
+
 	ctx := r.Context()
+	callerName := req.CallerName
 	resp, err := a.sipCli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
+		SipCallId:           fmt.Sprintf("soniq-invite-%d", time.Now().UnixMilli()),
+		Address:             address,
+		Transport:           3, // SIP_TRANSPORT_TLS = 3
 		CallTo:              identity,
+		Number:              req.CallerNumber,
+		DisplayName:         &callerName,
 		RoomName:            req.RoomName,
 		ParticipantIdentity: req.ParticipantIdentity,
 		ParticipantName:     req.ParticipantName,
-		// Address will be filled by ResolveEndpoint from Redis
-		// Number will be filled by ResolveEndpoint
-		Headers: map[string]string{
-			"X-SONIQ-Internal": "1",
-			"X-Caller-ID":     req.CallerNumber,
-			"X-Caller-Name":   req.CallerName,
-		},
 	})
 
 	if err != nil {
@@ -321,4 +330,18 @@ func (a *ActionServer) handleInviteToRoom(w http.ResponseWriter, r *http.Request
 		"participant_id": resp.GetParticipantId(),
 		"identity":       resp.GetParticipantIdentity(),
 	})
+}
+
+// resolveEndpointForInvite looks up a registered endpoint for invite-to-room.
+func (a *ActionServer) resolveEndpointForInvite(ctx context.Context, identity string) (string, map[string]string, error) {
+	if a.registrar != nil {
+		return a.registrar.ResolveEndpoint(ctx, identity)
+	}
+	// Fallback to Redis direct lookup
+	key := redisEndpointPrefix + identity
+	result, err := a.redis.HGetAll(ctx, key).Result()
+	if err != nil || len(result) == 0 {
+		return "", nil, fmt.Errorf("endpoint not found: %s", identity)
+	}
+	return result["contact_uri"], result, nil
 }
