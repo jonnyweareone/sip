@@ -27,16 +27,36 @@ import (
 // EndpointWriter writes SIP messages to registered phones via their
 // persistent TLS registration connections.
 type EndpointWriter struct {
-	log   logger.Logger
-	redis goredis.UniversalClient
-	srv   *sipgo.Server // sipgo server — owns the TLS listener and connection pool
-	mu    sync.RWMutex
+	log       logger.Logger
+	redis     goredis.UniversalClient
+	srv       *sipgo.Server // sipgo server — owns the TLS listener and connection pool
+	cli       *sipgo.Client // sipgo client — for transaction-based INVITE/ACK/BYE
+	mu        sync.RWMutex
+	// Pending INVITE calls — map callID → PendingCall
+	pending   map[string]*PendingCall
+	pendingMu sync.Mutex
+}
+
+// PendingCall tracks an outbound INVITE sent via the persistent TLS connection.
+type PendingCall struct {
+	CallID       string
+	Identity     string
+	NatAddr      string
+	FromTag      string
+	ToTag        string  // populated from 180/200 response
+	LocalSDP     string  // our SDP offer
+	RemoteSDP    string  // phone's SDP answer (from 200 OK)
+	RTPPort      int     // our offered RTP port
+	State        string  // "invited", "ringing", "answered", "bye"
+	Conf         *config.SONIQConfig
+	AnsweredChan chan struct{} // closed when 200 OK received
 }
 
 func NewEndpointWriter(log logger.Logger, rc goredis.UniversalClient) *EndpointWriter {
 	return &EndpointWriter{
-		log:   log.WithValues("component", "soniq-endpoint-writer"),
-		redis: rc,
+		log:     log.WithValues("component", "soniq-endpoint-writer"),
+		redis:   rc,
+		pending: make(map[string]*PendingCall),
 	}
 }
 
@@ -45,6 +65,13 @@ func (ew *EndpointWriter) SetServer(srv *sipgo.Server) {
 	ew.mu.Lock()
 	defer ew.mu.Unlock()
 	ew.srv = srv
+}
+
+// SetClient wires the sipgo client for transaction-based requests (INVITE).
+func (ew *EndpointWriter) SetClient(cli *sipgo.Client) {
+	ew.mu.Lock()
+	defer ew.mu.Unlock()
+	ew.cli = cli
 }
 
 // GetConnection returns the phone's persistent TLS connection from the
@@ -227,5 +254,188 @@ a=ptime:20
 		return "", fmt.Errorf("INVITE write to %s failed: %w", natAddr, err)
 	}
 
+	// Track this pending call for response matching
+	pc := &PendingCall{
+		CallID:       callID,
+		Identity:     identity,
+		NatAddr:      natAddr,
+		FromTag:      fromTag,
+		RTPPort:      int(rtpPort),
+		State:        "invited",
+		Conf:         conf,
+		AnsweredChan: make(chan struct{}),
+	}
+	ew.pendingMu.Lock()
+	ew.pending[callID] = pc
+	ew.pendingMu.Unlock()
+
 	return callID, nil
+}
+
+// HandleResponse processes a SIP response that arrived on the TLS connection.
+// Called from OnNoRoute or a response interceptor when sipgo can't match
+// a response to an existing transaction.
+func (ew *EndpointWriter) HandleResponse(resp *sip.Response) bool {
+	callID := ""
+	if h := resp.CallID(); h != nil {
+		callID = h.Value()
+	}
+	if callID == "" {
+		return false
+	}
+
+	ew.pendingMu.Lock()
+	pc, ok := ew.pending[callID]
+	ew.pendingMu.Unlock()
+	if !ok {
+		return false // not our call
+	}
+
+	// Extract To tag from response
+	if h := resp.To(); h != nil {
+		if tag, ok := h.Params.Get("tag"); ok {
+			pc.ToTag = tag
+		}
+	}
+
+	switch {
+	case resp.StatusCode >= 100 && resp.StatusCode < 200:
+		// Provisional (100 Trying, 180 Ringing, 183 Session Progress)
+		pc.State = "ringing"
+		ew.log.Infow("Phone ringing",
+			"identity", pc.Identity,
+			"callID", callID,
+			"status", resp.StatusCode,
+			"toTag", pc.ToTag,
+		)
+		return true
+
+	case resp.StatusCode == 200:
+		// 200 OK — phone answered! Send ACK and extract SDP answer
+		pc.State = "answered"
+		pc.RemoteSDP = string(resp.Body())
+		ew.log.Infow("Phone answered!",
+			"identity", pc.Identity,
+			"callID", callID,
+			"toTag", pc.ToTag,
+			"sdpLen", len(pc.RemoteSDP),
+		)
+
+		// Send ACK via persistent TLS
+		go ew.sendACK(pc, resp)
+
+		// Signal answered
+		select {
+		case <-pc.AnsweredChan:
+		default:
+			close(pc.AnsweredChan)
+		}
+		return true
+
+	case resp.StatusCode >= 300:
+		// Error response — call failed
+		ew.log.Warnw("INVITE rejected",
+			"identity", pc.Identity,
+			"callID", callID,
+			"status", resp.StatusCode,
+			"reason", resp.Reason(),
+		)
+		pc.State = "failed"
+		ew.pendingMu.Lock()
+		delete(ew.pending, callID)
+		ew.pendingMu.Unlock()
+		return true
+	}
+
+	return false
+}
+
+// sendACK sends an ACK for a 200 OK response via the persistent TLS connection.
+func (ew *EndpointWriter) sendACK(pc *PendingCall, resp *sip.Response) {
+	reqURI := sip.Uri{User: pc.Identity, Host: pc.Conf.Realm, Port: pc.Conf.RegPortListen}
+	ack := sip.NewRequest(sip.ACK, reqURI)
+
+	// Via
+	via := &sip.ViaHeader{
+		ProtocolName:    "SIP",
+		ProtocolVersion: "2.0",
+		Transport:       "TLS",
+		Host:            pc.Conf.ExternalIP,
+		Port:            pc.Conf.RegPortListen,
+		Params:          sip.NewParams(),
+	}
+	via.Params.Add("branch", sip.GenerateBranch())
+	ack.AppendHeader(via)
+
+	// From must match INVITE's From (with our tag)
+	ack.AppendHeader(sip.NewHeader("From",
+		fmt.Sprintf("<sip:soniq@%s>;tag=%s", pc.Conf.Realm, pc.FromTag)))
+	// To must include phone's tag from 200 OK
+	ack.AppendHeader(sip.NewHeader("To",
+		fmt.Sprintf("<sip:%s@%s:%d>;tag=%s", pc.Identity, pc.Conf.Realm, pc.Conf.RegPortListen, pc.ToTag)))
+	ack.AppendHeader(sip.NewHeader("Call-ID", pc.CallID))
+	ack.AppendHeader(sip.NewHeader("CSeq", "1 ACK"))
+	ack.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+
+	ctx := context.Background()
+	if err := ew.WriteMsg(ctx, pc.Identity, ack); err != nil {
+		ew.log.Errorw("ACK send failed", err, "callID", pc.CallID)
+		return
+	}
+
+	ew.log.Infow("ACK sent via persistent TLS",
+		"identity", pc.Identity,
+		"callID", pc.CallID,
+	)
+}
+
+// SendBYE ends an active call via persistent TLS.
+func (ew *EndpointWriter) SendBYE(ctx context.Context, callID string) error {
+	ew.pendingMu.Lock()
+	pc, ok := ew.pending[callID]
+	if ok {
+		delete(ew.pending, callID)
+	}
+	ew.pendingMu.Unlock()
+	if !ok {
+		return fmt.Errorf("no pending call with ID %s", callID)
+	}
+
+	reqURI := sip.Uri{User: pc.Identity, Host: pc.Conf.Realm, Port: pc.Conf.RegPortListen}
+	bye := sip.NewRequest(sip.BYE, reqURI)
+
+	via := &sip.ViaHeader{
+		ProtocolName:    "SIP",
+		ProtocolVersion: "2.0",
+		Transport:       "TLS",
+		Host:            pc.Conf.ExternalIP,
+		Port:            pc.Conf.RegPortListen,
+		Params:          sip.NewParams(),
+	}
+	via.Params.Add("branch", sip.GenerateBranch())
+	bye.AppendHeader(via)
+	bye.AppendHeader(sip.NewHeader("From",
+		fmt.Sprintf("<sip:soniq@%s>;tag=%s", pc.Conf.Realm, pc.FromTag)))
+	bye.AppendHeader(sip.NewHeader("To",
+		fmt.Sprintf("<sip:%s@%s:%d>;tag=%s", pc.Identity, pc.Conf.Realm, pc.Conf.RegPortListen, pc.ToTag)))
+	bye.AppendHeader(sip.NewHeader("Call-ID", pc.CallID))
+	bye.AppendHeader(sip.NewHeader("CSeq", "2 BYE"))
+	bye.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+
+	if err := ew.WriteMsg(ctx, pc.Identity, bye); err != nil {
+		return fmt.Errorf("BYE send failed: %w", err)
+	}
+
+	ew.log.Infow("BYE sent via persistent TLS",
+		"identity", pc.Identity,
+		"callID", pc.CallID,
+	)
+	return nil
+}
+
+// GetPendingCall returns a pending call by Call-ID.
+func (ew *EndpointWriter) GetPendingCall(callID string) *PendingCall {
+	ew.pendingMu.Lock()
+	defer ew.pendingMu.Unlock()
+	return ew.pending[callID]
 }

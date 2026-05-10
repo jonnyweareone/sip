@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/livekit/sipgo/sip"
 	"github.com/livekit/sipgo/transport"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -372,7 +373,11 @@ func (s *Service) Start() error {
 	// the TLS connection pool for direct writes to registered phones.
 	if s.epWriter != nil && s.srv.sipSrv != nil {
 		s.epWriter.SetServer(s.srv.sipSrv)
-		s.log.Infow("EndpointWriter wired to sipgo server transport layer")
+		// Register response middleware to intercept 180/200 for persistent TLS INVITEs
+		s.srv.sipSrv.OnResponse(func(resp *sip.Response) {
+			s.epWriter.HandleResponse(resp)
+		})
+		s.log.Infow("EndpointWriter wired to sipgo server transport layer + response middleware")
 	}
 
 	// SONIQ: Start action URL server for Yealink button presses
