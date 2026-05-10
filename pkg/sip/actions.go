@@ -81,6 +81,12 @@ func (a *ActionServer) registerRoutes() {
 	// POST /api/invite-endpoint — ring a registered phone via persistent TLS INVITE
 	a.mux.HandleFunc("/api/invite-endpoint", a.handleInviteEndpoint)
 
+	// GET /api/call/accept — phone presses Answer soft key, returns Execute XML
+	a.mux.HandleFunc("/api/call/accept", a.handleCallAccept)
+
+	// GET /api/call/reject — phone presses VM/Block/Dismiss soft key
+	a.mux.HandleFunc("/api/call/reject", a.handleCallReject)
+
 	// Health check
 	a.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -711,6 +717,68 @@ func (a *ActionServer) handleInviteEndpoint(w http.ResponseWriter, r *http.Reque
 		"call_id": callID,
 		"identity": identity,
 	})
+}
+
+// handleCallAccept — phone pressed Answer soft key.
+// Returns Execute XML that stops ringing, resets LEDs, dials into room.
+// GET /api/call/accept?room=xxx&ext=1000
+func (a *ActionServer) handleCallAccept(w http.ResponseWriter, r *http.Request) {
+	room := r.URL.Query().Get("room")
+	ext := r.URL.Query().Get("ext")
+
+	a.log.Infow("call accepted", "room", room, "ext", ext)
+
+	audioBase := fmt.Sprintf("http://%s:9090", a.conf.ExternalIP)
+
+	xml := fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
+<YealinkIPPhoneExecute Beep="no">
+  <ExecuteItem URI="Wav.Stop:%s/ring-announce.wav"/>
+  <ExecuteItem URI="Led:LINE1_GREEN=on"/>
+  <ExecuteItem URI="Led:POWER=on"/>
+</YealinkIPPhoneExecute>`, audioBase)
+
+	// TODO: After stopping ring, push INVITE to phone to bridge into LiveKit room
+	// For now, also send an INVITE via EndpointWriter in background
+	if room != "" && ext != "" && a.epWriter != nil {
+		identity := ext + ".soniq-master"
+		go func() {
+			callID, err := a.epWriter.InviteEndpoint(context.Background(), identity, a.conf, "SONIQ Bridge", room)
+			if err != nil {
+				a.log.Errorw("bridge invite failed", err, "room", room, "ext", ext)
+			} else {
+				a.log.Infow("bridge invite sent", "room", room, "ext", ext, "callID", callID)
+			}
+		}()
+	}
+
+	w.Header().Set("Content-Type", "text/xml; charset=ISO-8859-1")
+	w.Header().Set("Cache-Control", "no-store, no-cache")
+	w.Write([]byte(xml))
+}
+
+// handleCallReject — phone pressed VM/Block/Dismiss soft key.
+// Returns Execute XML that stops ringing and resets phone to idle.
+// GET /api/call/reject?room=xxx&action=vm|block|dismiss&ext=1000
+func (a *ActionServer) handleCallReject(w http.ResponseWriter, r *http.Request) {
+	room := r.URL.Query().Get("room")
+	action := r.URL.Query().Get("action")
+	ext := r.URL.Query().Get("ext")
+
+	a.log.Infow("call rejected", "room", room, "action", action, "ext", ext)
+
+	audioBase := fmt.Sprintf("http://%s:9090", a.conf.ExternalIP)
+
+	xml := fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
+<YealinkIPPhoneExecute Beep="no">
+  <ExecuteItem URI="Wav.Stop:%s/ring-announce.wav"/>
+  <ExecuteItem URI="Led:LINE1_GREEN=off"/>
+  <ExecuteItem URI="Led:LINE1_RED=off"/>
+  <ExecuteItem URI="Led:POWER=off"/>
+</YealinkIPPhoneExecute>`, audioBase)
+
+	w.Header().Set("Content-Type", "text/xml; charset=ISO-8859-1")
+	w.Header().Set("Cache-Control", "no-store, no-cache")
+	w.Write([]byte(xml))
 }
 
 // buildSoftKeysXML generates SoftKey XML elements.
