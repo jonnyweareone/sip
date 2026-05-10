@@ -618,10 +618,11 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	notify.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", identity, a.conf.Realm)))
 	notify.AppendHeader(sip.NewHeader("Call-ID", fmt.Sprintf("page-%d@%s", time.Now().UnixNano(), a.conf.ExternalIP)))
 	notify.AppendHeader(sip.NewHeader("CSeq", "1 NOTIFY"))
-	notify.AppendHeader(sip.NewHeader("Event", "xml-push"))
+	notify.AppendHeader(sip.NewHeader("Event", "Yealink-xml"))
 	notify.AppendHeader(sip.NewHeader("Subscription-State", "active"))
 	notify.AppendHeader(sip.NewHeader("Content-Type", "application/xml"))
 	notify.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+	notify.AppendHeader(sip.NewHeader("Content-Length", fmt.Sprintf("%d", len(xmlBody))))
 	notify.SetBody([]byte(xmlBody))
 
 	ctx := r.Context()
