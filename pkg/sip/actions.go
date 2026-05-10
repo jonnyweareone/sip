@@ -738,15 +738,17 @@ func (a *ActionServer) handleCallAccept(w http.ResponseWriter, r *http.Request) 
 </YealinkIPPhoneExecute>`, audioBase)
 
 	// TODO: After stopping ring, push INVITE to phone to bridge into LiveKit room
-	// For now, also send an INVITE via EndpointWriter in background
+	// Auto-answer so phone picks up silently — no second ring screen
 	if room != "" && ext != "" && a.epWriter != nil {
 		identity := ext + ".soniq-master"
 		go func() {
-			callID, err := a.epWriter.InviteEndpoint(context.Background(), identity, a.conf, "SONIQ Bridge", room)
+			// Small delay to let the Wav.Stop execute first
+			time.Sleep(500 * time.Millisecond)
+			callID, err := a.epWriter.InviteEndpoint(context.Background(), identity, a.conf, "SONIQ Bridge", room, true)
 			if err != nil {
 				a.log.Errorw("bridge invite failed", err, "room", room, "ext", ext)
 			} else {
-				a.log.Infow("bridge invite sent", "room", room, "ext", ext, "callID", callID)
+				a.log.Infow("bridge invite sent (auto-answer)", "room", room, "ext", ext, "callID", callID)
 			}
 		}()
 	}

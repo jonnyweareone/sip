@@ -174,7 +174,7 @@ func msgMethod(msg sip.Message) string {
 // InviteEndpoint builds and sends a SIP INVITE to a registered phone via its
 // persistent TLS connection. Returns the Call-ID for response matching.
 // The phone will respond with 100/180/200 on the same TLS socket.
-func (ew *EndpointWriter) InviteEndpoint(ctx context.Context, identity string, conf *config.SONIQConfig, callerName, callerNumber string) (string, error) {
+func (ew *EndpointWriter) InviteEndpoint(ctx context.Context, identity string, conf *config.SONIQConfig, callerName, callerNumber string, autoAnswer ...bool) (string, error) {
 	conn, natAddr, err := ew.GetConnection(ctx, identity)
 	if err != nil {
 		return "", err
@@ -218,6 +218,13 @@ func (ew *EndpointWriter) InviteEndpoint(ctx context.Context, identity string, c
 	invite.AppendHeader(sip.NewHeader("Contact",
 		fmt.Sprintf("<sip:soniq@%s:%d;transport=TLS>", conf.ExternalIP, conf.RegPortListen)))
 	invite.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, NOTIFY, OPTIONS"))
+
+	// Auto-answer: phone picks up immediately without ringing
+	if len(autoAnswer) > 0 && autoAnswer[0] {
+		invite.AppendHeader(sip.NewHeader("Call-Info", ";answer-after=0"))
+		invite.AppendHeader(sip.NewHeader("Alert-Info", "info=alert-autoanswer"))
+	}
+
 	invite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 
 	// SDP — offer G722 + PCMU on server's public IP
