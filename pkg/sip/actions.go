@@ -78,6 +78,9 @@ func (a *ActionServer) registerRoutes() {
 	// POST /api/page — send XML screen pop to a registered phone via persistent TLS
 	a.mux.HandleFunc("/api/page", a.handlePage)
 
+	// POST /api/invite-endpoint — ring a registered phone via persistent TLS INVITE
+	a.mux.HandleFunc("/api/invite-endpoint", a.handleInviteEndpoint)
+
 	// Health check
 	a.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -638,6 +641,76 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	a.log.Infow("page sent", "identity", identity, "type", req.Type, "title", req.Title)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "identity": identity, "type": req.Type})
+}
+
+// handleInviteEndpoint rings a registered phone via persistent TLS INVITE.
+// POST /api/invite-endpoint
+// Body: { "extension": "1000", "org_slug": "soniq-master",
+//         "caller_name": "Craig Gillingham", "caller_number": "07547868935" }
+func (a *ActionServer) handleInviteEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	// Auth
+	secret := r.Header.Get("X-Internal-Secret")
+	if secret != "sNq-nTfY-2026-xK9p" {
+		http.Error(w, "forbidden", 403)
+		return
+	}
+
+	var req struct {
+		Extension    string `json:"extension"`
+		OrgSlug      string `json:"org_slug"`
+		CallerName   string `json:"caller_name"`
+		CallerNumber string `json:"caller_number"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), 400)
+		return
+	}
+	if req.Extension == "" {
+		http.Error(w, "extension required", 400)
+		return
+	}
+	if req.OrgSlug == "" {
+		req.OrgSlug = "soniq-master"
+	}
+	if req.CallerNumber == "" {
+		req.CallerNumber = "anonymous"
+	}
+	if req.CallerName == "" {
+		req.CallerName = req.CallerNumber
+	}
+
+	identity := req.Extension + "." + req.OrgSlug
+
+	if a.epWriter == nil {
+		http.Error(w, "endpoint writer not available", 503)
+		return
+	}
+
+	callID, err := a.epWriter.InviteEndpoint(r.Context(), identity, a.conf, req.CallerName, req.CallerNumber)
+	if err != nil {
+		a.log.Errorw("invite-endpoint failed", err, "identity", identity)
+		http.Error(w, "invite failed: "+err.Error(), 500)
+		return
+	}
+
+	a.log.Infow("invite-endpoint sent",
+		"identity", identity,
+		"callID", callID,
+		"caller", req.CallerName,
+		"callerNum", req.CallerNumber,
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":      true,
+		"call_id": callID,
+		"identity": identity,
+	})
 }
 
 // buildSoftKeysXML generates SoftKey XML elements.

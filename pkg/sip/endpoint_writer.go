@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/sipgo/sip"
@@ -20,6 +21,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	sipgo "github.com/livekit/sipgo"
+	"github.com/livekit/sip/pkg/config"
 )
 
 // EndpointWriter writes SIP messages to registered phones via their
@@ -140,4 +142,90 @@ func msgMethod(msg sip.Message) string {
 		return fmt.Sprintf("%d", resp.StatusCode)
 	}
 	return "unknown"
+}
+
+// InviteEndpoint builds and sends a SIP INVITE to a registered phone via its
+// persistent TLS connection. Returns the Call-ID for response matching.
+// The phone will respond with 100/180/200 on the same TLS socket.
+func (ew *EndpointWriter) InviteEndpoint(ctx context.Context, identity string, conf *config.SONIQConfig, callerName, callerNumber string) (string, error) {
+	conn, natAddr, err := ew.GetConnection(ctx, identity)
+	if err != nil {
+		return "", err
+	}
+
+	callID := fmt.Sprintf("soniq-ep-%d@%s", time.Now().UnixNano(), conf.ExternalIP)
+	fromTag := fmt.Sprintf("soniq-%d", time.Now().UnixMilli())
+
+	// Build INVITE
+	reqURI := sip.Uri{User: identity, Host: conf.Realm, Port: conf.RegPortListen}
+	invite := sip.NewRequest(sip.INVITE, reqURI)
+
+	// Via
+	via := &sip.ViaHeader{
+		ProtocolName:    "SIP",
+		ProtocolVersion: "2.0",
+		Transport:       "TLS",
+		Host:            conf.ExternalIP,
+		Port:            conf.RegPortListen,
+		Params:          sip.NewParams(),
+	}
+	via.Params.Add("branch", sip.GenerateBranch())
+	via.Params.Add("rport", "")
+	invite.AppendHeader(via)
+
+	// From (caller)
+	fromDisplay := callerName
+	if fromDisplay == "" {
+		fromDisplay = callerNumber
+	}
+	invite.AppendHeader(sip.NewHeader("From",
+		fmt.Sprintf("\"%s\" <sip:%s@%s>;tag=%s", fromDisplay, callerNumber, conf.Realm, fromTag)))
+
+	// To (phone)
+	invite.AppendHeader(sip.NewHeader("To",
+		fmt.Sprintf("<sip:%s@%s:%d>", identity, conf.Realm, conf.RegPortListen)))
+
+	invite.AppendHeader(sip.NewHeader("Call-ID", callID))
+	invite.AppendHeader(sip.NewHeader("CSeq", "1 INVITE"))
+	invite.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+	invite.AppendHeader(sip.NewHeader("Contact",
+		fmt.Sprintf("<sip:soniq@%s:%d;transport=TLS>", conf.ExternalIP, conf.RegPortListen)))
+	invite.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, NOTIFY, OPTIONS"))
+	invite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+
+	// SDP — offer G722 + PCMU on server's public IP
+	// Use a dynamic RTP port (we'll need to allocate one properly later)
+	rtpPort := 20000 + (time.Now().UnixMilli() % 10000)
+	sdp := fmt.Sprintf(`v=0
+o=soniq %d %d IN IP4 %s
+s=SONIQ Call
+c=IN IP4 %s
+t=0 0
+m=audio %d RTP/AVP 9 0 8 101
+a=rtpmap:9 G722/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-16
+a=sendrecv
+a=ptime:20
+`, time.Now().Unix(), time.Now().Unix(), conf.ExternalIP,
+		conf.ExternalIP, rtpPort)
+
+	invite.SetBody([]byte(sdp))
+
+	ew.log.Infow("Sending INVITE to registered endpoint",
+		"identity", identity,
+		"natAddr", natAddr,
+		"callID", callID,
+		"caller", callerName,
+		"callerNum", callerNumber,
+		"rtpPort", rtpPort,
+	)
+
+	if err := conn.WriteMsg(invite); err != nil {
+		return "", fmt.Errorf("INVITE write to %s failed: %w", natAddr, err)
+	}
+
+	return callID, nil
 }
