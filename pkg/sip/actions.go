@@ -87,6 +87,9 @@ func (a *ActionServer) registerRoutes() {
 	// GET /api/call/reject — phone presses VM/Block/Dismiss soft key
 	a.mux.HandleFunc("/api/call/reject", a.handleCallReject)
 
+	// GET /api/boot — phone completed provisioning, trigger welcome tour
+	a.mux.HandleFunc("/api/boot", a.handleBoot)
+
 	// Health check
 	a.mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -791,6 +794,76 @@ func (a *ActionServer) handleCallReject(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/xml; charset=ISO-8859-1")
 	w.Header().Set("Cache-Control", "no-store, no-cache")
 	w.Write([]byte(xml))
+}
+
+// handleBoot — phone provisioned, push welcome tour via persistent TLS.
+func (a *ActionServer) handleBoot(w http.ResponseWriter, r *http.Request) {
+	ext := r.URL.Query().Get("ext")
+	mac := r.URL.Query().Get("mac")
+	if ext == "" {
+		http.Error(w, "ext required", 400)
+		return
+	}
+	extNum := ext
+	if idx := strings.Index(ext, "."); idx > 0 {
+		extNum = ext[:idx]
+	}
+	a.log.Infow("boot: phone provisioned", "ext", extNum, "mac", mac)
+	w.WriteHeader(200)
+	_, _ = w.Write([]byte("ok"))
+	if a.epWriter == nil {
+		return
+	}
+	go func() {
+		identity := extNum + ".soniq-master"
+		audioBase := fmt.Sprintf("http://%s:9090", a.conf.ExternalIP)
+		for attempt := 1; attempt <= 5; attempt++ {
+			time.Sleep(time.Duration(2+attempt*3) * time.Second)
+			tourXML := fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
+<YealinkIPPhoneImageScreen Beep="no" Timeout="0" LockIn="no">
+<Image>%s/screen-tour-1-t54.png</Image>
+<SoftKey index="4"><Label>Next</Label><URI>https://soniqmail.co.uk/api/phone/tour?step=2&amp;ext=%s&amp;name=User&amp;mac=%s</URI></SoftKey>
+</YealinkIPPhoneImageScreen>`, audioBase, extNum, mac)
+			ctx := context.Background()
+			err := a.pushXMLToPhone(ctx, identity, tourXML)
+			if err != nil {
+				a.log.Infow("boot: attempt failed", "attempt", attempt, "ext", extNum, "error", err.Error())
+				continue
+			}
+			a.log.Infow("boot: tour pushed", "attempt", attempt, "ext", extNum)
+			time.Sleep(1 * time.Second)
+			ttsXML := fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
+<YealinkIPPhoneExecute Beep="no">
+<ExecuteItem URI="Wav.Play:%s/tour-step1.wav"/>
+</YealinkIPPhoneExecute>`, audioBase)
+			_ = a.pushXMLToPhone(ctx, identity, ttsXML)
+			return
+		}
+		a.log.Warnw("boot: tour failed after 5 attempts", fmt.Errorf("timeout"), "ext", extNum)
+	}()
+}
+
+// pushXMLToPhone sends a Yealink XML NOTIFY to a registered phone via EndpointWriter.
+func (a *ActionServer) pushXMLToPhone(ctx context.Context, identity string, xmlBody string) error {
+	reqURI := sip.Uri{User: identity, Host: a.conf.Realm}
+	notify := sip.NewRequest(sip.NOTIFY, reqURI)
+	via := &sip.ViaHeader{
+		ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "TLS",
+		Host: a.conf.ExternalIP, Port: a.conf.RegPortListen, Params: sip.NewParams(),
+	}
+	via.Params.Add("branch", sip.GenerateBranch())
+	notify.AppendHeader(via)
+	notify.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:soniq@%s>;tag=push-%d", a.conf.Realm, time.Now().UnixMilli())))
+	notify.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", identity, a.conf.Realm)))
+	notify.AppendHeader(sip.NewHeader("Call-ID", fmt.Sprintf("push-%d@%s", time.Now().UnixNano(), a.conf.ExternalIP)))
+	notify.AppendHeader(sip.NewHeader("CSeq", "1 NOTIFY"))
+	notify.AppendHeader(sip.NewHeader("Event", "Yealink-xml"))
+	notify.AppendHeader(sip.NewHeader("Subscription-State", "active"))
+	notify.AppendHeader(sip.NewHeader("Content-Type", "application/xml"))
+	notify.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+	notify.AppendHeader(sip.NewHeader("Content-Length", fmt.Sprintf("%d", len(xmlBody))))
+	notify.SetBody([]byte(xmlBody))
+	return a.epWriter.WriteMsg(ctx, identity, notify)
 }
 
 // buildSoftKeysXML generates SoftKey XML elements.

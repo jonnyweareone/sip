@@ -93,11 +93,95 @@ def render_wallboard(w, h, data):
         y += h * 0.10
     return img
 
+def render_missed_call(w, h, data):
+    img, draw, fonts = render_base(w, h)
+    draw.text((w*0.05, h*0.22), "Missed Call", fill=(255, 100, 100), font=fonts["title"])
+    caller = data.get("caller", "Unknown")
+    company = data.get("company", "")
+    number = data.get("number", "")
+    time_str = data.get("time", "Just now")
+    lines = [
+        (caller + (" - " + company if company else ""), (255, 255, 255)),
+        (number, (180, 190, 210)),
+        ("Time: " + time_str, (180, 190, 210)),
+        ("Rang for " + data.get("duration", "20s") + " - no answer", (255, 180, 100)),
+    ]
+    y = h * 0.36
+    for text, color in lines:
+        draw.text((w*0.05, y), text, fill=color, font=fonts["body"])
+        y += h * 0.10
+    return img
+
+def render_voicemail(w, h, data):
+    img, draw, fonts = render_base(w, h)
+    draw.text((w*0.05, h*0.22), "New Voicemail", fill=(100, 200, 255), font=fonts["title"])
+    caller = data.get("caller", "Unknown")
+    company = data.get("company", "")
+    duration = data.get("duration", "0:00")
+    transcript = data.get("transcript", "")
+    lines = [
+        (caller + (" - " + company if company else ""), (255, 255, 255)),
+        ("Duration: " + duration, (180, 190, 210)),
+    ]
+    if transcript:
+        words = transcript.split()
+        line = ""
+        for word in words:
+            if len(line + " " + word) > 45:
+                lines.append((line, (160, 170, 190)))
+                line = word
+            else:
+                line = (line + " " + word).strip()
+        if line:
+            lines.append((line, (160, 170, 190)))
+    y = h * 0.36
+    for text, color in lines[:7]:
+        draw.text((w*0.05, y), text, fill=color, font=fonts["body"])
+        y += h * 0.075
+    return img
+
+def render_transfer(w, h, data):
+    img, draw, fonts = render_base(w, h)
+    draw.text((w*0.05, h*0.22), "Transfer Call", fill=(220, 220, 240), font=fonts["title"])
+    caller = data.get("caller", "Unknown")
+    draw.text((w*0.05, h*0.34), "From: " + caller, fill=(255, 255, 255), font=fonts["body"])
+    exts = data.get("extensions", "").split("|")
+    y = h * 0.46
+    for i, ext_info in enumerate(exts[:5]):
+        parts = ext_info.split(":")
+        name = parts[0] if parts else ""
+        status = parts[1] if len(parts) > 1 else "Unknown"
+        color = (100, 255, 130) if "Available" in status else (255, 180, 100) if "On Call" in status else (180, 190, 210)
+        draw.text((w*0.05, y), str(i+1) + ". " + name + " - " + status, fill=color, font=fonts["body"])
+        y += h * 0.08
+    return img
+
+def render_call_log(w, h, data):
+    img, draw, fonts = render_base(w, h)
+    draw.text((w*0.05, h*0.22), "Recent Calls", fill=(220, 220, 240), font=fonts["title"])
+    entries = data.get("entries", "").split("|")
+    y = h * 0.34
+    for entry in entries[:7]:
+        parts = entry.split(":")
+        if len(parts) >= 3:
+            direction = parts[0]
+            name = parts[1]
+            time_str = parts[2]
+            icon = "< " if direction == "in" else "> " if direction == "out" else "x "
+            color = (100, 255, 130) if direction == "in" else (180, 190, 210) if direction == "out" else (255, 100, 100)
+            draw.text((w*0.05, y), icon + name + "  " + time_str, fill=color, font=fonts["body"])
+            y += h * 0.075
+    return img
+
 TEMPLATES = {
     "call_summary": render_call_summary,
     "scam_alert": render_scam_alert,
     "pre_call": render_pre_call,
     "wallboard": render_wallboard,
+    "missed_call": render_missed_call,
+    "voicemail": render_voicemail,
+    "transfer": render_transfer,
+    "call_log": render_call_log,
 }
 
 if __name__ == "__main__":
