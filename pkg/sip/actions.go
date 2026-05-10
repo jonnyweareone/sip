@@ -472,10 +472,10 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	switch req.Type {
 	case "text":
 		softKeysXML := buildSoftKeysXML(req.SoftKeys)
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<YealinkIPPhoneTextScreen Beep="%s"%s%s>
-<Title>%s</Title>
-<Text>%s</Text>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
+<YealinkIPPhoneTextScreen Beep="%s"%s%s LockIn="no">
+  <Title>%s</Title>
+  <Text>%s</Text>
 %s
 </YealinkIPPhoneTextScreen>`, beepStr, timeoutStr, refreshAttr, xmlEscape(req.Title), xmlEscape(req.Text), softKeysXML)
 
@@ -486,34 +486,37 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 			if size == "" {
 				size = "normal"
 			}
-			linesXML += fmt.Sprintf(`<Line Position="%d" Size="%s">%s</Line>
+			linesXML += fmt.Sprintf(`  <Line Position="%d" Size="%s">%s</Line>
 `, l.Position, size, xmlEscape(l.Text))
 		}
 		softKeysXML := buildSoftKeysXML(req.SoftKeys)
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<YealinkIPPhoneFormattedTextScreen Beep="%s"%s>
-<Title>%s</Title>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
+<YealinkIPPhoneFormattedTextScreen Beep="%s"%s LockIn="no">
+  <Title>%s</Title>
 %s%s
 </YealinkIPPhoneFormattedTextScreen>`, beepStr, timeoutStr, xmlEscape(req.Title), linesXML, softKeysXML)
 
 	case "menu":
 		menuItemsXML := ""
 		for _, item := range req.MenuItems {
-			menuItemsXML += fmt.Sprintf(`<MenuItem Prompt="%s" URI="%s"/>
+			menuItemsXML += fmt.Sprintf(`  <MenuItem>
+    <Prompt>%s</Prompt>
+    <URI>%s</URI>
+  </MenuItem>
 `, xmlEscape(item.Prompt), item.URI)
 		}
 		style := req.Style
 		if style == "" {
 			style = "numbered"
 		}
-		wrapStr := "no"
-		if req.WrapList {
-			wrapStr = "yes"
+		wrapStr := "yes"
+		if !req.WrapList {
+			wrapStr = "no"
 		}
 		softKeysXML := buildSoftKeysXML(req.SoftKeys)
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
 <YealinkIPPhoneTextMenu Beep="%s"%s style="%s" wrapList="%s" LockIn="no">
-<Title>%s</Title>
+  <Title>%s</Title>
 %s%s
 </YealinkIPPhoneTextMenu>`, beepStr, timeoutStr, style, wrapStr, xmlEscape(req.Title), menuItemsXML, softKeysXML)
 
@@ -521,66 +524,66 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 		inputsXML := ""
 		for _, inp := range req.Inputs {
 			if inp.Selection != "" {
-				inputsXML += fmt.Sprintf(`<InputField>
-<Prompt>%s</Prompt>
-<Selection>%s</Selection>
-<URI>%s</URI>
-</InputField>
+				inputsXML += fmt.Sprintf(`  <InputField>
+    <Prompt>%s</Prompt>
+    <Selection>%s</Selection>
+    <URI>%s</URI>
+  </InputField>
 `, xmlEscape(inp.Prompt), xmlEscape(inp.Selection), inp.URI)
 			} else {
-				inputsXML += fmt.Sprintf(`<InputField>
-<Prompt>%s</Prompt>
-<URI>%s</URI>
-</InputField>
+				inputsXML += fmt.Sprintf(`  <InputField>
+    <Prompt>%s</Prompt>
+    <URI>%s</URI>
+  </InputField>
 `, xmlEscape(inp.Prompt), inp.URI)
 			}
 		}
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
 <YealinkIPPhoneInputScreen Beep="%s"%s>
-<Title>%s</Title>
+  <Title>%s</Title>
 %s
 </YealinkIPPhoneInputScreen>`, beepStr, timeoutStr, xmlEscape(req.Title), inputsXML)
 
 	case "directory":
 		contactsXML := ""
 		for _, c := range req.Contacts {
-			contactsXML += fmt.Sprintf(`<DirectoryEntry>
-<Name>%s</Name>
-<Telephone>%s</Telephone>
-</DirectoryEntry>
+			contactsXML += fmt.Sprintf(`  <DirectoryEntry>
+    <Name>%s</Name>
+    <Telephone>%s</Telephone>
+  </DirectoryEntry>
 `, xmlEscape(c.Name), c.Telephone)
 		}
 		softKeysXML := buildSoftKeysXML(req.SoftKeys)
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
 <YealinkIPPhoneDirectory Beep="%s"%s>
-<Title>%s</Title>
+  <Title>%s</Title>
 %s%s
 </YealinkIPPhoneDirectory>`, beepStr, timeoutStr, xmlEscape(req.Title), contactsXML, softKeysXML)
 
 	case "execute":
 		items := ""
 		for _, item := range req.Items {
-			items += fmt.Sprintf(`<ExecuteItem URI="%s"/>
+			items += fmt.Sprintf(`  <ExecuteItem URI="%s"/>
 `, item)
 		}
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
 <YealinkIPPhoneExecute Beep="%s">
 %s</YealinkIPPhoneExecute>`, beepStr, items)
 
 	case "config":
 		items := ""
 		for _, item := range req.Items {
-			items += fmt.Sprintf(`<Item>%s</Item>
+			items += fmt.Sprintf(`  <Item>%s</Item>
 `, item)
 		}
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
 <YealinkIPPhoneConfiguration>
 %s</YealinkIPPhoneConfiguration>`, items)
 
 	case "status":
-		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
 <YealinkIPPhoneStatus Beep="%s">
-<Message>%s</Message>
+  <Message>%s</Message>
 </YealinkIPPhoneStatus>`, beepStr, xmlEscape(req.Text))
 
 	case "raw":
@@ -648,10 +651,10 @@ func buildSoftKeysXML(keys []struct {
 	}
 	out := ""
 	for _, k := range keys {
-		out += fmt.Sprintf(`<SoftKey index="%d">
-<Label>%s</Label>
-<URI>%s</URI>
-</SoftKey>
+		out += fmt.Sprintf(`  <SoftKey index="%d">
+    <Label>%s</Label>
+    <URI>%s</URI>
+  </SoftKey>
 `, k.Index, xmlEscape(k.Label), k.URI)
 	}
 	return out
