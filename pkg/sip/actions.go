@@ -725,30 +725,40 @@ func (a *ActionServer) handleInviteEndpoint(w http.ResponseWriter, r *http.Reque
 func (a *ActionServer) handleCallAccept(w http.ResponseWriter, r *http.Request) {
 	room := r.URL.Query().Get("room")
 	ext := r.URL.Query().Get("ext")
+	callerName := r.URL.Query().Get("caller_name")
+	callerNum := r.URL.Query().Get("caller_num")
+	if callerName == "" {
+		callerName = callerNum
+	}
+	if callerName == "" {
+		callerName = "Incoming Call"
+	}
 
-	a.log.Infow("call accepted", "room", room, "ext", ext)
+	a.log.Infow("call accepted", "room", room, "ext", ext, "caller", callerName)
 
 	audioBase := fmt.Sprintf("http://%s:9090", a.conf.ExternalIP)
 
+	// Stop ALL possible ring/TTS audio files
 	xml := fmt.Sprintf(`<?xml version="1.0" encoding="ISO-8859-1"?>
 <YealinkIPPhoneExecute Beep="no">
   <ExecuteItem URI="Wav.Stop:%s/ring-announce.wav"/>
+  <ExecuteItem URI="Wav.Stop:%s/ring-jonny.wav"/>
+  <ExecuteItem URI="Wav.Stop:%s/ring-uk.wav"/>
+  <ExecuteItem URI="Wav.Stop:%s/ring-tone.wav"/>
   <ExecuteItem URI="Led:LINE1_GREEN=on"/>
   <ExecuteItem URI="Led:POWER=on"/>
-</YealinkIPPhoneExecute>`, audioBase)
+</YealinkIPPhoneExecute>`, audioBase, audioBase, audioBase, audioBase)
 
-	// TODO: After stopping ring, push INVITE to phone to bridge into LiveKit room
-	// Auto-answer so phone picks up silently — no second ring screen
+	// Auto-answer INVITE with caller's actual name — no second ring
 	if room != "" && ext != "" && a.epWriter != nil {
 		identity := ext + ".soniq-master"
 		go func() {
-			// Small delay to let the Wav.Stop execute first
 			time.Sleep(500 * time.Millisecond)
-			callID, err := a.epWriter.InviteEndpoint(context.Background(), identity, a.conf, "SONIQ Bridge", room, true)
+			callID, err := a.epWriter.InviteEndpoint(context.Background(), identity, a.conf, callerName, callerNum, true)
 			if err != nil {
 				a.log.Errorw("bridge invite failed", err, "room", room, "ext", ext)
 			} else {
-				a.log.Infow("bridge invite sent (auto-answer)", "room", room, "ext", ext, "callID", callID)
+				a.log.Infow("bridge invite sent (auto-answer)", "room", room, "ext", ext, "callID", callID, "caller", callerName)
 			}
 		}()
 	}
