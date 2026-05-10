@@ -334,11 +334,11 @@ func (ew *EndpointWriter) HandleResponse(resp *sip.Response) bool {
 
 	case resp.StatusCode >= 300:
 		// Error response — call failed
-		ew.log.Warnw("INVITE rejected",
+		ew.log.Warnw("INVITE rejected", fmt.Errorf("status %d", resp.StatusCode),
 			"identity", pc.Identity,
 			"callID", callID,
 			"status", resp.StatusCode,
-			"reason", resp.Reason(),
+			"reason", resp.Reason,
 		)
 		pc.State = "failed"
 		ew.pendingMu.Lock()
