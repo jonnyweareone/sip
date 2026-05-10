@@ -143,6 +143,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260427160629-7cedc36a6bc4 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
 )
-
-// SONIQ: Use our sipgo fork with OnResponse middleware for persistent TLS INVITE handling
-replace github.com/livekit/sipgo => github.com/jonnyweareone/sipgo v0.0.0-20260510094143-ffedb9a837f9

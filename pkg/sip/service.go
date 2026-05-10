@@ -373,11 +373,15 @@ func (s *Service) Start() error {
 	// the TLS connection pool for direct writes to registered phones.
 	if s.epWriter != nil && s.srv.sipSrv != nil {
 		s.epWriter.SetServer(s.srv.sipSrv)
-		// Register response middleware to intercept 180/200 for persistent TLS INVITEs
-		s.srv.sipSrv.OnResponse(func(resp *sip.Response) {
-			s.epWriter.HandleResponse(resp)
+		// Register response handler on the transport layer to intercept
+		// 180/200 for persistent TLS INVITEs sent via EndpointWriter.
+		// Transport layer handlers receive ALL messages (requests + responses).
+		s.srv.sipSrv.TransportLayer().OnMessage(func(msg sip.Message) {
+			if resp, ok := msg.(*sip.Response); ok {
+				s.epWriter.HandleResponse(resp)
+			}
 		})
-		s.log.Infow("EndpointWriter wired to sipgo server transport layer + response middleware")
+		s.log.Infow("EndpointWriter wired to sipgo server transport layer + response handler")
 	}
 
 	// SONIQ: Start action URL server for Yealink button presses
