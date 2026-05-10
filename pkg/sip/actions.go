@@ -354,9 +354,35 @@ func (a *ActionServer) resolveEndpointForInvite(ctx context.Context, identity st
 
 // handlePage sends Yealink XML via SIP NOTIFY through the persistent TLS connection.
 // POST /api/page
-// Body: { "extension": "1000", "org_slug": "soniq-master", "type": "text|execute|config",
-//         "title": "...", "text": "...", "beep": true, "timeout": 10,
-//         "items": ["Led:LINE2_GREEN=on"] }
+//
+// Supported types:
+//   text           - YealinkIPPhoneTextScreen (message popup)
+//   formatted_text - YealinkIPPhoneFormattedTextScreen (rich text with line sizes)
+//   menu           - YealinkIPPhoneTextMenu (navigable menu with URIs)
+//   input          - YealinkIPPhoneInputScreen (form with input fields)
+//   directory      - YealinkIPPhoneDirectory (phonebook with dial)
+//   execute        - YealinkIPPhoneExecute (LED, Wav.Play, Dial, Key, Command)
+//   config         - YealinkIPPhoneConfiguration (live cfg changes)
+//   status         - YealinkIPPhoneStatus (status bar update)
+//   raw            - Pass raw XML directly (for custom/complex screens)
+//
+// Common fields:
+//   extension  - "1000" (required)
+//   org_slug   - "soniq-master" (default)
+//   beep       - true/false
+//   timeout    - seconds (0 = no timeout)
+//
+// Type-specific fields:
+//   title      - screen title (text, formatted_text, menu, input, directory)
+//   text       - body text (text, status)
+//   items      - string array (execute URIs, config items)
+//   lines      - [{position, size, text}] (formatted_text)
+//   menu_items - [{prompt, uri}] (menu)
+//   soft_keys  - [{index, label, uri}] (menu, text)
+//   inputs     - [{prompt, selection, uri}] (input)
+//   contacts   - [{name, telephone}] (directory)
+//   refresh    - {seconds, url} (auto-refresh)
+//   raw_xml    - raw XML string (raw type)
 func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -364,15 +390,54 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Extension string   `json:"extension"`
-		OrgSlug   string   `json:"org_slug"`
-		Type      string   `json:"type"`     // "text", "execute", "config"
-		Title     string   `json:"title"`
-		Text      string   `json:"text"`
-		Beep      bool     `json:"beep"`
-		Timeout   int      `json:"timeout"`
-		Items     []string `json:"items"`    // for execute/config
+		Extension string `json:"extension"`
+		OrgSlug   string `json:"org_slug"`
+		Type      string `json:"type"`
+		Title     string `json:"title"`
+		Text      string `json:"text"`
+		Beep      bool   `json:"beep"`
+		Timeout   int    `json:"timeout"`
+		// Execute/Config
+		Items []string `json:"items"`
+		// FormattedTextScreen
+		Lines []struct {
+			Position int    `json:"position"`
+			Size     string `json:"size"` // small, normal, large
+			Text     string `json:"text"`
+		} `json:"lines"`
+		// TextMenu
+		MenuItems []struct {
+			Prompt string `json:"prompt"`
+			URI    string `json:"uri"`
+		} `json:"menu_items"`
+		Style    string `json:"style"` // none, numbered
+		WrapList bool   `json:"wrap_list"`
+		// SoftKeys (for menu/text screens)
+		SoftKeys []struct {
+			Index int    `json:"index"` // 1-4
+			Label string `json:"label"`
+			URI   string `json:"uri"`
+		} `json:"soft_keys"`
+		// InputScreen
+		Inputs []struct {
+			Prompt    string `json:"prompt"`
+			Selection string `json:"selection"` // comma-separated options
+			URI       string `json:"uri"`
+		} `json:"inputs"`
+		// Directory
+		Contacts []struct {
+			Name      string `json:"name"`
+			Telephone string `json:"telephone"`
+		} `json:"contacts"`
+		// Auto-refresh
+		Refresh *struct {
+			Seconds int    `json:"seconds"`
+			URL     string `json:"url"`
+		} `json:"refresh"`
+		// Raw XML passthrough
+		RawXML string `json:"raw_xml"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request: "+err.Error(), 400)
 		return
@@ -387,49 +452,146 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "text"
 	}
-	if req.Timeout == 0 {
-		req.Timeout = 10
-	}
 
 	identity := req.Extension + "." + req.OrgSlug
-
-	// Build Yealink XML body based on type
-	var xmlBody string
 	beepStr := "no"
 	if req.Beep {
 		beepStr = "yes"
 	}
+	timeoutStr := ""
+	if req.Timeout > 0 {
+		timeoutStr = fmt.Sprintf(` Timeout="%d"`, req.Timeout)
+	}
+	refreshAttr := ""
+	if req.Refresh != nil && req.Refresh.Seconds > 0 {
+		refreshAttr = fmt.Sprintf(` refresh="%d" url="%s"`, req.Refresh.Seconds, req.Refresh.URL)
+	}
+
+	var xmlBody string
 
 	switch req.Type {
 	case "text":
+		softKeysXML := buildSoftKeysXML(req.SoftKeys)
 		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<YealinkIPPhoneTextScreen Beep="%s" Timeout="%d">
+<YealinkIPPhoneTextScreen Beep="%s"%s%s>
 <Title>%s</Title>
 <Text>%s</Text>
-</YealinkIPPhoneTextScreen>`, beepStr, req.Timeout, req.Title, req.Text)
+%s
+</YealinkIPPhoneTextScreen>`, beepStr, timeoutStr, refreshAttr, xmlEscape(req.Title), xmlEscape(req.Text), softKeysXML)
+
+	case "formatted_text":
+		linesXML := ""
+		for _, l := range req.Lines {
+			size := l.Size
+			if size == "" {
+				size = "normal"
+			}
+			linesXML += fmt.Sprintf(`<Line Position="%d" Size="%s">%s</Line>
+`, l.Position, size, xmlEscape(l.Text))
+		}
+		softKeysXML := buildSoftKeysXML(req.SoftKeys)
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneFormattedTextScreen Beep="%s"%s>
+<Title>%s</Title>
+%s%s
+</YealinkIPPhoneFormattedTextScreen>`, beepStr, timeoutStr, xmlEscape(req.Title), linesXML, softKeysXML)
+
+	case "menu":
+		menuItemsXML := ""
+		for _, item := range req.MenuItems {
+			menuItemsXML += fmt.Sprintf(`<MenuItem Prompt="%s" URI="%s"/>
+`, xmlEscape(item.Prompt), item.URI)
+		}
+		style := req.Style
+		if style == "" {
+			style = "numbered"
+		}
+		wrapStr := "no"
+		if req.WrapList {
+			wrapStr = "yes"
+		}
+		softKeysXML := buildSoftKeysXML(req.SoftKeys)
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneTextMenu Beep="%s"%s style="%s" wrapList="%s" LockIn="no">
+<Title>%s</Title>
+%s%s
+</YealinkIPPhoneTextMenu>`, beepStr, timeoutStr, style, wrapStr, xmlEscape(req.Title), menuItemsXML, softKeysXML)
+
+	case "input":
+		inputsXML := ""
+		for _, inp := range req.Inputs {
+			if inp.Selection != "" {
+				inputsXML += fmt.Sprintf(`<InputField>
+<Prompt>%s</Prompt>
+<Selection>%s</Selection>
+<URI>%s</URI>
+</InputField>
+`, xmlEscape(inp.Prompt), xmlEscape(inp.Selection), inp.URI)
+			} else {
+				inputsXML += fmt.Sprintf(`<InputField>
+<Prompt>%s</Prompt>
+<URI>%s</URI>
+</InputField>
+`, xmlEscape(inp.Prompt), inp.URI)
+			}
+		}
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneInputScreen Beep="%s"%s>
+<Title>%s</Title>
+%s
+</YealinkIPPhoneInputScreen>`, beepStr, timeoutStr, xmlEscape(req.Title), inputsXML)
+
+	case "directory":
+		contactsXML := ""
+		for _, c := range req.Contacts {
+			contactsXML += fmt.Sprintf(`<DirectoryEntry>
+<Name>%s</Name>
+<Telephone>%s</Telephone>
+</DirectoryEntry>
+`, xmlEscape(c.Name), c.Telephone)
+		}
+		softKeysXML := buildSoftKeysXML(req.SoftKeys)
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneDirectory Beep="%s"%s>
+<Title>%s</Title>
+%s%s
+</YealinkIPPhoneDirectory>`, beepStr, timeoutStr, xmlEscape(req.Title), contactsXML, softKeysXML)
 
 	case "execute":
 		items := ""
 		for _, item := range req.Items {
-			items += fmt.Sprintf(`<ExecuteItem URI="%s"/>`, item)
+			items += fmt.Sprintf(`<ExecuteItem URI="%s"/>
+`, item)
 		}
 		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <YealinkIPPhoneExecute Beep="%s">
-%s
-</YealinkIPPhoneExecute>`, beepStr, items)
+%s</YealinkIPPhoneExecute>`, beepStr, items)
 
 	case "config":
 		items := ""
 		for _, item := range req.Items {
-			items += fmt.Sprintf(`<Item>%s</Item>`, item)
+			items += fmt.Sprintf(`<Item>%s</Item>
+`, item)
 		}
 		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <YealinkIPPhoneConfiguration>
-%s
-</YealinkIPPhoneConfiguration>`, items)
+%s</YealinkIPPhoneConfiguration>`, items)
+
+	case "status":
+		xmlBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<YealinkIPPhoneStatus Beep="%s">
+<Message>%s</Message>
+</YealinkIPPhoneStatus>`, beepStr, xmlEscape(req.Text))
+
+	case "raw":
+		if req.RawXML == "" {
+			http.Error(w, "raw_xml required for type=raw", 400)
+			return
+		}
+		xmlBody = req.RawXML
 
 	default:
-		http.Error(w, "type must be text, execute, or config", 400)
+		http.Error(w, "unsupported type: "+req.Type, 400)
 		return
 	}
 
@@ -442,7 +604,6 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	reqURI := sip.Uri{User: identity, Host: a.conf.Realm}
 	notify := sip.NewRequest(sip.NOTIFY, reqURI)
 
-	// Via header required
 	via := &sip.ViaHeader{
 		ProtocolName:    "SIP",
 		ProtocolVersion: "2.0",
@@ -473,4 +634,33 @@ func (a *ActionServer) handlePage(w http.ResponseWriter, r *http.Request) {
 	a.log.Infow("page sent", "identity", identity, "type", req.Type, "title", req.Title)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "identity": identity, "type": req.Type})
+}
+
+// buildSoftKeysXML generates SoftKey XML elements.
+func buildSoftKeysXML(keys []struct {
+	Index int    `json:"index"`
+	Label string `json:"label"`
+	URI   string `json:"uri"`
+}) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	out := ""
+	for _, k := range keys {
+		out += fmt.Sprintf(`<SoftKey index="%d">
+<Label>%s</Label>
+<URI>%s</URI>
+</SoftKey>
+`, k.Index, xmlEscape(k.Label), k.URI)
+	}
+	return out
+}
+
+// xmlEscape escapes special XML characters in text content.
+func xmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	return s
 }
