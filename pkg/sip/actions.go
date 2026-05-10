@@ -762,6 +762,13 @@ func (a *ActionServer) handleCallAccept(w http.ResponseWriter, r *http.Request) 
 				a.log.Errorw("bridge invite failed", err, "room", room, "ext", ext)
 			} else {
 				a.log.Infow("bridge invite sent (auto-answer)", "room", room, "ext", ext, "callID", callID, "caller", callerName)
+				// Force-answer by simulating speaker key press after INVITE lands
+				time.Sleep(800 * time.Millisecond)
+				pushXMLToPhone(a.epWriter, identity, `<?xml version="1.0" encoding="ISO-8859-1"?>
+<YealinkIPPhoneExecute Beep="no">
+  <ExecuteItem URI="Key:SPEAKER"/>
+</YealinkIPPhoneExecute>`, a.log)
+				a.log.Infow("force-answer Key:SPEAKER pushed", "ext", ext, "callID", callID)
 			}
 		}()
 	}
