@@ -18,8 +18,11 @@ package sip
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -253,9 +256,27 @@ func (s *Server) handleExternalCall(
 	trunkAddr := "34.147.235.69:5060" // OneHub
 	callerDisplay := s.displayName(ctx, callerIdentity)
 
-	// Outbound CLI — must be a real number the trunk accepts.
-	// TODO: look up org's outbound CLI from org_settings or sip_trunks table
-	callerNumber := "+442046283328" // SONIQ main number for now
+	// Outbound CLI — look up the caller's org_users.caller_id_number
+	callerNumber := "+442046283328" // fallback if no CLI configured
+	{
+		ext := extensionFromIdentity(callerIdentity)
+		cliURL := fmt.Sprintf("%s/rest/v1/org_users?org_id=eq.%s&extension=eq.%s&select=caller_id_number&limit=1",
+			s.conf.SONIQ.SupabaseURL, orgID, ext)
+		if cliReq, err := http.NewRequestWithContext(ctx, "GET", cliURL, nil); err == nil {
+			cliReq.Header.Set("apikey", s.conf.SONIQ.SupabaseAnonKey)
+			cliReq.Header.Set("Authorization", "Bearer "+s.conf.SONIQ.SupabaseAnonKey)
+			if cliResp, err := http.DefaultClient.Do(cliReq); err == nil {
+				defer cliResp.Body.Close()
+				var users []struct{ CallerIDNumber *string `json:"caller_id_number"` }
+				if body, err := io.ReadAll(cliResp.Body); err == nil {
+					if json.Unmarshal(body, &users) == nil && len(users) > 0 && users[0].CallerIDNumber != nil && *users[0].CallerIDNumber != "" {
+						callerNumber = *users[0].CallerIDNumber
+						log.Infow("outbound CLI resolved from org_users", "cli", callerNumber, "ext", ext)
+					}
+				}
+			}
+		}
+	}
 
 	// Invite the PSTN side SYNCHRONOUSLY — caller hears ringback until remote answers
 	log.Infow("ringing caller while inviting PSTN", "trunk", trunkAddr, "cli", callerNumber)
