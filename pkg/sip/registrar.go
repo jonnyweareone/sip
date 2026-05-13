@@ -126,6 +126,8 @@ func (reg *Registrar) OnRegister(req *sip.Request, tx sip.ServerTransaction) {
 		reg.redis.Del(ctx, key)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 		log.Infow("endpoint de-registered")
+		// Async sync offline status to Supabase
+		reg.syncDeviceStatus(identity, userAgent, src.Addr().String(), "", "", "offline")
 		return
 	}
 
@@ -234,6 +236,9 @@ func (reg *Registrar) OnRegister(req *sip.Request, tx sip.ServerTransaction) {
 	log.Infow("endpoint registered",
 		"orgID", dbCred.OrgID, "contact", contactURI, "ttl", ttl.String(),
 	)
+
+	// Async sync to Supabase sip_devices — updates status, vendor, model, device_model_id
+	reg.syncDeviceStatus(identity, userAgent, src.Addr().String(), contactURI, dbCred.OrgID, "registered")
 }
 
 // lookupCredentials queries Supabase PostgREST for sip_credentials.
@@ -304,6 +309,117 @@ func (reg *Registrar) getChallenge(sipCallID string) *digest.Challenge {
 	}
 	delete(reg.challenges, sipCallID)
 	return &rc.challenge
+}
+
+// parseUserAgent extracts vendor and model from SIP User-Agent header.
+// Examples:
+//   "Yealink SIP-T77U 185.87.0.15" → ("Yealink", "T77U")
+//   "Yealink SIP-T54W 80:5e:c0:3e:2c:49" → ("Yealink", "T54W")
+//   "Grandstream GXP2170 1.0.11.5" → ("Grandstream", "GXP2170")
+func parseUserAgent(ua string) (vendor, model string) {
+	parts := strings.Fields(ua)
+	if len(parts) == 0 {
+		return "", ""
+	}
+	vendor = parts[0] // "Yealink", "Grandstream", "Fanvil", etc.
+	if len(parts) >= 2 {
+		model = parts[1]
+		// Strip "SIP-" prefix (Yealink format: "SIP-T77U")
+		model = strings.TrimPrefix(model, "SIP-")
+		// Strip "GXP" etc. aren't prefixed, so no further strip needed
+	}
+	return vendor, model
+}
+
+// syncDeviceStatus updates sip_devices in Supabase after a successful
+// REGISTER or de-REGISTER. Runs async (goroutine) so it never blocks SIP.
+// Also resolves device_model_id from device_models table by vendor+model.
+func (reg *Registrar) syncDeviceStatus(identity, userAgent, natIP, contactURI, orgID, status string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		log := reg.log.WithValues("identity", identity, "syncStatus", status)
+
+		vendor, model := parseUserAgent(userAgent)
+
+		// --- Resolve device_model_id from device_models table ---
+		var deviceModelID *string
+		if vendor != "" && model != "" {
+			dmURL := fmt.Sprintf("%s/rest/v1/device_models?vendor=eq.%s&model=eq.%s&select=id&limit=1",
+				reg.soniq.SupabaseURL, vendor, model)
+			if dmReq, err := http.NewRequestWithContext(ctx, "GET", dmURL, nil); err == nil {
+				dmReq.Header.Set("apikey", reg.soniq.SupabaseAnonKey)
+				dmReq.Header.Set("Authorization", "Bearer "+reg.soniq.SupabaseAnonKey)
+				if dmResp, err := reg.client.Do(dmReq); err == nil {
+					defer dmResp.Body.Close()
+					var models []struct{ ID string `json:"id"` }
+					if body, err := io.ReadAll(dmResp.Body); err == nil {
+						if json.Unmarshal(body, &models) == nil && len(models) > 0 {
+							deviceModelID = &models[0].ID
+						}
+					}
+				}
+			}
+		}
+
+		// --- Build PATCH payload ---
+		now := time.Now().UTC().Format(time.RFC3339)
+		patch := map[string]interface{}{
+			"status":     status,
+			"user_agent": userAgent,
+		}
+		if status == "registered" {
+			patch["last_registered_at"] = now
+			patch["last_registered_ip"] = natIP
+			patch["contact_uri"] = contactURI
+		}
+		if vendor != "" {
+			patch["vendor"] = vendor
+		}
+		if model != "" {
+			patch["model"] = model
+		}
+		if deviceModelID != nil {
+			patch["device_model_id"] = *deviceModelID
+		}
+
+		jsonBody, err := json.Marshal(patch)
+		if err != nil {
+			log.Errorw("syncDeviceStatus marshal failed", err)
+			return
+		}
+
+		// PATCH sip_devices where sip_username matches identity
+		patchURL := fmt.Sprintf("%s/rest/v1/sip_devices?sip_username=eq.%s",
+			reg.soniq.SupabaseURL, identity)
+		httpReq, err := http.NewRequestWithContext(ctx, "PATCH", patchURL, strings.NewReader(string(jsonBody)))
+		if err != nil {
+			log.Errorw("syncDeviceStatus request build failed", err)
+			return
+		}
+		httpReq.Header.Set("apikey", reg.soniq.SupabaseAnonKey)
+		httpReq.Header.Set("Authorization", "Bearer "+reg.soniq.SupabaseAnonKey)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Prefer", "return=minimal")
+
+		resp, err := reg.client.Do(httpReq)
+		if err != nil {
+			log.Warnw("syncDeviceStatus request failed", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			log.Warnw("syncDeviceStatus non-2xx", nil,
+				"statusCode", resp.StatusCode, "body", string(body))
+			return
+		}
+
+		log.Infow("device status synced to Supabase",
+			"vendor", vendor, "model", model,
+			"hasModelID", deviceModelID != nil)
+	}()
 }
 
 func extractMAC(ua string) string {
