@@ -87,6 +87,12 @@ func (a *ActionServer) registerRoutes() {
 	// GET /api/call/reject — phone presses VM/Block/Dismiss soft key
 	a.mux.HandleFunc("/api/call/reject", a.handleCallReject)
 
+	// POST /api/call/hangup — end an established call (returns room+participant for LiveKit removal)
+	a.mux.HandleFunc("/api/call/hangup", a.handleCallHangup)
+
+	// POST /api/call/cancel — cancel a ringing call (returns room+participant for LiveKit removal)
+	a.mux.HandleFunc("/api/call/cancel", a.handleCallCancel)
+
 	// GET /api/boot — phone completed provisioning, trigger welcome tour
 	a.mux.HandleFunc("/api/boot", a.handleBoot)
 
@@ -341,6 +347,9 @@ func (a *ActionServer) handleInviteToRoom(w http.ResponseWriter, r *http.Request
 		http.Error(w, "invite failed: "+err.Error(), 500)
 		return
 	}
+
+	// Store active call in Redis for cancel/hangup lookup
+	a.storeActiveCall(ctx, identity, resp.GetParticipantId(), req.RoomName, "ringing")
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
