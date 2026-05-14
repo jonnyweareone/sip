@@ -1011,7 +1011,7 @@ authLoop:
 		// Try again with a computed digest
 	}
 
-	c.invite, c.inviteOk = req, resp
+	c.invite, c.inviteOk = req, resp  // Also stored early in attemptInvite for CANCEL
 	toHeader = resp.To()
 	if toHeader == nil {
 		return nil, errors.New("no To header in INVITE response")
@@ -1103,8 +1103,12 @@ func (c *sipOutbound) attemptInvite(ctx context.Context, callID sip.CallIDHeader
 		req.SetDestination(dest)
 	}
 
+	// SONIQ: Store INVITE early so sendCancel() can construct CANCEL during ringing state
+	c.invite = req
+
 	tx, err := c.c.sipCli.TransactionRequest(req)
 	if err != nil {
+		c.invite = nil
 		return nil, nil, err
 	}
 	defer tx.Terminate()
