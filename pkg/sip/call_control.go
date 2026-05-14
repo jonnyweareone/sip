@@ -1,9 +1,8 @@
 // SONIQ Call Control — track active SIP invites for cancel/hangup
 //
-// invite-to-room stores call state in Redis.
-// /api/call/hangup and /api/call/cancel return room+participant info
-// so the router can call LiveKit RemoveParticipant.
-// Also attempts direct SIP BYE/CANCEL as fallback.
+// invite-to-room stores call state + SIP Call-ID in Redis BEFORE sending INVITE.
+// /api/call/cancel sends SIP BYE directly via persistent TLS using the stored Call-ID.
+// /api/call/hangup does the same for established calls.
 
 package sip
 
@@ -13,6 +12,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/livekit/sipgo/sip"
 )
 
 const redisActiveCallPrefix = "sip:active:"
@@ -40,23 +41,19 @@ func (a *ActionServer) clearActiveCall(ctx context.Context, identity string) {
 	a.redis.Del(ctx, redisActiveCallPrefix+identity)
 }
 
-func (a *ActionServer) getActiveCall(ctx context.Context, identity string) (string, string, string, error) {
+func (a *ActionServer) getActiveCall(ctx context.Context, identity string) (map[string]string, error) {
 	key := redisActiveCallPrefix + identity
 	result, err := a.redis.HGetAll(ctx, key).Result()
 	if err != nil || len(result) == 0 {
-		return "", "", "", fmt.Errorf("no active call for %s", identity)
+		return nil, fmt.Errorf("no active call for %s", identity)
 	}
-	return result["participant_id"], result["room_name"], result["state"], nil
+	return result, nil
 }
 
-// handleCallHangup returns room + participant info for the router to do LiveKit removal.
-// POST /api/call/hangup { "extension": "1000", "org_slug": "soniq-master" }
 func (a *ActionServer) handleCallHangup(w http.ResponseWriter, r *http.Request) {
 	a.handleCallControl(w, r, "hangup")
 }
 
-// handleCallCancel returns room + participant info for ringing calls.
-// POST /api/call/cancel { "extension": "1000", "org_slug": "soniq-master" }
 func (a *ActionServer) handleCallCancel(w http.ResponseWriter, r *http.Request) {
 	a.handleCallControl(w, r, "cancel")
 }
@@ -84,25 +81,47 @@ func (a *ActionServer) handleCallControl(w http.ResponseWriter, r *http.Request,
 	identity := req.Extension + "." + req.OrgSlug
 	ctx := r.Context()
 
-	pid, room, state, err := a.getActiveCall(ctx, identity)
-	if err != nil {
-		pid = "sip-" + req.Extension
-		state = "unknown"
+	// Look up active call from Redis
+	call, err := a.getActiveCall(ctx, identity)
+	sipCallID := ""
+	roomName := req.RoomName
+	participantID := req.ParticipantID
+	state := "unknown"
+
+	if err == nil {
+		sipCallID = call["sip_call_id"]
+		if roomName == "" {
+			roomName = call["room_name"]
+		}
+		if participantID == "" {
+			participantID = call["participant_id"]
+		}
+		state = call["state"]
 	}
-	if req.RoomName != "" {
-		room = req.RoomName
-	}
-	if req.ParticipantID != "" {
-		pid = req.ParticipantID
+	if participantID == "" {
+		participantID = "sip-" + req.Extension
 	}
 
 	a.log.Infow("call "+action,
 		"identity", identity,
-		"room", room,
-		"participant", pid,
+		"room", roomName,
+		"participant", participantID,
+		"sip_call_id", sipCallID,
 		"state", state,
 		"reason", req.Reason,
 	)
+
+	// Send SIP BYE directly via persistent TLS connection
+	byeSent := false
+	if sipCallID != "" {
+		err := a.sendSIPBye(ctx, identity, sipCallID)
+		if err != nil {
+			a.log.Errorw("direct SIP BYE failed", err, "identity", identity)
+		} else {
+			a.log.Infow("direct SIP BYE sent", "identity", identity, "call_id", sipCallID)
+			byeSent = true
+		}
+	}
 
 	a.clearActiveCall(ctx, identity)
 
@@ -111,8 +130,38 @@ func (a *ActionServer) handleCallControl(w http.ResponseWriter, r *http.Request,
 		"ok":             true,
 		"action":         action,
 		"identity":       identity,
-		"participant_id": pid,
-		"room_name":      room,
+		"participant_id": participantID,
+		"room_name":      roomName,
+		"sip_call_id":    sipCallID,
+		"bye_sent":       byeSent,
 		"state":          state,
 	})
+}
+
+// sendSIPBye sends a SIP BYE directly to the phone via persistent TLS connection.
+// Uses the Call-ID from the original INVITE so the phone matches the dialog.
+func (a *ActionServer) sendSIPBye(ctx context.Context, identity string, sipCallID string) error {
+	if a.epWriter == nil {
+		return fmt.Errorf("endpoint writer not available")
+	}
+
+	reqURI := sip.Uri{User: identity, Host: a.conf.Realm}
+	bye := sip.NewRequest(sip.BYE, reqURI)
+
+	via := &sip.ViaHeader{
+		ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "TLS",
+		Host: a.conf.ExternalIP, Port: a.conf.RegPortListen, Params: sip.NewParams(),
+	}
+	via.Params.Add("branch", sip.GenerateBranch())
+	bye.AppendHeader(via)
+
+	// Use the SAME Call-ID as the original INVITE so phone matches the dialog
+	bye.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<sip:soniq@%s>;tag=bye-%d", a.conf.Realm, time.Now().UnixMilli())))
+	bye.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<sip:%s@%s>", identity, a.conf.Realm)))
+	bye.AppendHeader(sip.NewHeader("Call-ID", sipCallID))
+	bye.AppendHeader(sip.NewHeader("CSeq", "2 BYE"))
+	bye.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+	bye.AppendHeader(sip.NewHeader("Content-Length", "0"))
+
+	return a.epWriter.WriteMsg(ctx, identity, bye)
 }

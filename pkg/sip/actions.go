@@ -329,8 +329,14 @@ func (a *ActionServer) handleInviteToRoom(w http.ResponseWriter, r *http.Request
 
 	ctx := r.Context()
 	callerName := req.CallerName
+	sipCallID := fmt.Sprintf("soniq-invite-%d", time.Now().UnixMilli())
+
+	// Store call info in Redis BEFORE invite (so cancel can find it while ringing)
+	a.storeActiveCall(ctx, identity, req.ParticipantIdentity, req.RoomName, "ringing")
+	a.redis.HSet(ctx, redisActiveCallPrefix+identity, "sip_call_id", sipCallID)
+
 	resp, err := a.sipCli.CreateSIPParticipant(ctx, &rpc.InternalCreateSIPParticipantRequest{
-		SipCallId:           fmt.Sprintf("soniq-invite-%d", time.Now().UnixMilli()),
+		SipCallId:           sipCallID,
 		Address:             address,
 		Transport:           3, // SIP_TRANSPORT_TLS = 3
 		CallTo:              identity,
